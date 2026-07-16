@@ -3,6 +3,10 @@ base: core24
 version: '1.0'
 title: OPL3 RetroWave MIDI Player
 license: AGPL-3.0-or-later
+contact: https://github.com/carlosbravoa/retro-midi-player-opl3-gm/issues
+issues: https://github.com/carlosbravoa/retro-midi-player-opl3-gm/issues
+source-code: https://github.com/carlosbravoa/retro-midi-player-opl3-gm
+website: https://github.com/carlosbravoa/retro-midi-player-opl3-gm
 summary: Play MIDI on a RetroWave OPL3 board, PC speakers, or external MIDI
 description: |
   A GUI player that turns Standard MIDI files into OPL3 FM synthesis (via
