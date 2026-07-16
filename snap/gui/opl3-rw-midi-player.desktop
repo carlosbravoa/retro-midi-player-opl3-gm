@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OPL3 RetroWave MIDI Player
+Comment=Play MIDI files on a RetroWave OPL3 board, PC speakers, or an external MIDI device
+Exec=opl3-rw-midi-player %F
+Icon=${SNAP}/meta/gui/opl3-rw-midi-player.png
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=MIDI;OPL3;FM;RetroWave;chiptune;synth;

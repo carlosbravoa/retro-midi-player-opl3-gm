@@ -1,0 +1,91 @@
+name: opl3-rw-midi-player
+base: core24
+version: '1.0'
+title: OPL3 RetroWave MIDI Player
+license: AGPL-3.0-or-later
+summary: Play MIDI on a RetroWave OPL3 board, PC speakers, or external MIDI
+description: |
+  A GUI player that turns Standard MIDI files into OPL3 FM synthesis (via
+  libADLMIDI) and streams them to a RetroWave OPL3 Express board over
+  USB-serial, to your PC's speakers, or — as raw MIDI — to an external
+  hardware synth (a General MIDI module) through ALSA.
+
+  Features a Winamp-style playlist with folder loading and shuffle, a live
+  OPL3 channel visualizer (LED / neon / spectrum), a picker for libADLMIDI's
+  built-in FM banks (or ALSA MIDI devices in external mode), and settings that
+  persist between runs.
+
+  After installing, connect the hardware interfaces the player needs:
+    snap connect opl3-rw-midi-player:serial-port   # the RetroWave OPL3 board
+    snap connect opl3-rw-midi-player:alsa          # an external MIDI device
+  PC audio, display and home-folder access connect automatically.
+
+confinement: strict
+grade: stable
+
+platforms:
+  amd64:
+  arm64:
+
+layout:
+  # libasound (used for the external-MIDI sequencer) reads its config from the
+  # normal system path; map it to the bundled copy so it resolves in the sandbox.
+  /usr/share/alsa:
+    bind: $SNAP/usr/share/alsa
+
+apps:
+  opl3-rw-midi-player:
+    command: bin/opl3-launch
+    # The gnome extension wires up graphics, fonts, portals, GTK (for the
+    # zenity "Open Folder" dialog) and PulseAudio audio.
+    extensions: [gnome]
+    plugs:
+      - audio-playback     # PC-speaker output (SDL via PulseAudio)
+      - alsa               # external-MIDI output (ALSA sequencer) — connect manually
+      - serial-port        # RetroWave OPL3 Express board — connect manually
+      - home               # load MIDI folders from your home directory
+      - removable-media    # load MIDI folders from USB drives
+
+parts:
+  # Fetch libADLMIDI during the (networked) pull phase so the build itself is
+  # offline/reproducible. build.sh compiles it — including its internal headers,
+  # which the player's fan-out chip needs and which are not installed by cmake.
+  libadlmidi-src:
+    plugin: dump
+    source: https://github.com/Wohlstand/libADLMIDI.git
+    source-type: git
+    source-depth: 1
+    organize:
+      '*': libADLMIDI/
+    prime:
+      - -*        # staged for the player part only, not shipped as-is
+
+  player:
+    after: [libadlmidi-src]
+    plugin: nil
+    source: .
+    override-pull: |
+      craftctl default
+      # Drop any local build artifacts copied from the working tree.
+      rm -rf "$CRAFT_PART_SRC/libADLMIDI" "$CRAFT_PART_SRC/build" \
+             "$CRAFT_PART_SRC/opl3-rw-midi-player"
+    override-build: |
+      # Use the pre-fetched libADLMIDI; build.sh sees it present and skips cloning.
+      cp -a "$CRAFT_STAGE/libADLMIDI" "$CRAFT_PART_BUILD/libADLMIDI"
+      ./build.sh
+      install -Dm755 opl3-rw-midi-player "$CRAFT_PART_INSTALL/bin/opl3-rw-midi-player"
+      install -Dm755 snap/local/opl3-launch "$CRAFT_PART_INSTALL/bin/opl3-launch"
+    build-packages:
+      - g++
+      - cmake
+      - make
+      - git
+      - pkg-config
+      - libsdl2-dev
+      - libasound2-dev
+    stage-packages:
+      - libsdl2-2.0-0
+      - libpulse0
+      - libasound2
+      - libasound2-data
+      - zenity

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Launch wrapper for the SDL2 player under snap strict confinement.
+# Runs after the gnome extension's command-chain (GTK/portals/audio env set up).
+
+# Steer SDL's PC-speaker output to PulseAudio; the in-sandbox ALSA PCM has no
+# config. (The external-MIDI output still uses the ALSA sequencer via `alsa`.)
+export SDL_AUDIODRIVER=pulseaudio
+
+# Belt-and-suspenders: if the pulse socket env isn't already set, point at it.
+if [ -z "$PULSE_SERVER" ]; then
+    uid="$(id -u 2>/dev/null)"
+    [ -n "$uid" ] && export PULSE_SERVER="unix:/run/user/$uid/pulse/native"
+fi
+
+# Make the bundled zenity discoverable (the GUI "Open Folder" dialog).
+export PATH="$SNAP/usr/bin:$PATH"
+
+exec "$SNAP/bin/opl3-rw-midi-player" "$@"

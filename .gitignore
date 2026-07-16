@@ -1,0 +1,14 @@
+/build/
+/libADLMIDI/
+/opl3-rw-midi-player
+*.o
+*.bmp
+
+# snapcraft
+*.snap
+/parts/
+/stage/
+/prime/
+
+# local-only, never commit
+CLAUDE.md
