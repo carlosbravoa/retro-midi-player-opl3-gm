@@ -77,7 +77,7 @@ This produces `./opl3-rw-midi-player`. Run it:
 
 ```sh
 snapcraft                                                    # produces the .snap
-sudo snap install ./opl3-rw-midi-player_1.0_amd64.snap --dangerous
+sudo snap install ./retro-midi-player-opl3-gm_1.0_amd64.snap --dangerous
 ```
 
 `--dangerous` allows installing a locally-built, unsigned snap. The first
@@ -94,7 +94,7 @@ back to PC audio only.
 **External MIDI device (ALSA):**
 
 ```sh
-sudo snap connect opl3-rw-midi-player:alsa
+sudo snap connect retro-midi-player-opl3-gm:alsa
 ```
 
 **RetroWave OPL3 board (serial port):** on classic Ubuntu there is no
@@ -114,7 +114,7 @@ sudo snap interface serial-port
 #     - snapd:retrowaveopl3express   <-- your slot name (varies by device)
 
 # 3. Connect your snap's plug to that slot.
-sudo snap connect opl3-rw-midi-player:serial-port snapd:retrowaveopl3express
+sudo snap connect retro-midi-player-opl3-gm:serial-port snapd:retrowaveopl3express
 ```
 
 > The slot name (`retrowaveopl3express` above) is derived from the board's USB
@@ -125,9 +125,9 @@ sudo snap connect opl3-rw-midi-player:serial-port snapd:retrowaveopl3express
 ### 3. Verify and run
 
 ```sh
-snap connections opl3-rw-midi-player      # :alsa and :serial-port should show "connected"
-opl3-rw-midi-player --list-midi           # should list your external MIDI device
-opl3-rw-midi-player ~/midis/              # launch; cycle OUT: to Board / EXT-MIDI
+snap connections retro-midi-player-opl3-gm   # :alsa and :serial-port should show "connected"
+retro-midi-player-opl3-gm --list-midi        # should list your external MIDI device
+retro-midi-player-opl3-gm ~/midis/           # launch; cycle OUT: to Board / EXT-MIDI
 ```
 
 Re-installing the snap resets these manual connections — re-run the two `snap
@@ -136,11 +136,13 @@ connect` commands (hotplug stays enabled, so the slot is already there).
 ### Notes for the snap
 
 - **Settings and config** live in the snap's own data dir
-  (`~/snap/opl3-rw-midi-player/current/.config/...`), not your global
+  (`~/snap/retro-midi-player-opl3-gm/current/.config/...`), not your global
   `~/.config`.
 - **Loading music:** the `home` interface (auto-connected) lets the player read
   MIDI files under your home directory; `removable-media` covers USB drives
-  (connect it if needed: `sudo snap connect opl3-rw-midi-player:removable-media`).
+  (connect it if needed: `sudo snap connect retro-midi-player-opl3-gm:removable-media`).
+- **Command name:** the snap installs as `retro-midi-player-opl3-gm` (the
+  from-source binary is `opl3-rw-midi-player`).
 - **Open Folder** uses the GTK file dialog provided by the GNOME platform.
 
 ---

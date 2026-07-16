@@ -1,4 +1,4 @@
-name: opl3-rw-midi-player
+name: retro-midi-player-opl3-gm
 base: core24
 version: '1.0'
 title: OPL3 RetroWave MIDI Player
@@ -20,8 +20,8 @@ description: |
   persist between runs.
 
   After installing, connect the hardware interfaces the player needs:
-    snap connect opl3-rw-midi-player:serial-port   # the RetroWave OPL3 board
-    snap connect opl3-rw-midi-player:alsa          # an external MIDI device
+    snap connect retro-midi-player-opl3-gm:serial-port   # the RetroWave OPL3 board
+    snap connect retro-midi-player-opl3-gm:alsa          # an external MIDI device
   PC audio, display and home-folder access connect automatically.
 
 confinement: strict
@@ -38,7 +38,7 @@ layout:
     bind: $SNAP/usr/share/alsa
 
 apps:
-  opl3-rw-midi-player:
+  retro-midi-player-opl3-gm:
     command: bin/opl3-launch
     # The gnome extension wires up graphics, fonts, portals, GTK (for the
     # zenity "Open Folder" dialog) and PulseAudio audio.
