@@ -16,10 +16,12 @@
 struct Config {
     int  bank    = -1;      // libADLMIDI bank ordinal; -1 => pick a default
     bool recurse = false;   // scan subfolders
-    bool loop    = false;   // repeat current track
+    int  loop    = 0;       // repeat: 0 off, 1 current track, 2 whole playlist
     bool shuffle = false;   // shuffled playback order
     int  style   = 0;       // visualizer: 0 LED, 1 NEON, 2 SPEC
     int  outmode = -1;      // output: -1 auto, 0 PC, 1 BOARD, 2 EXT-MIDI
+    int  win_w   = 980;     // GUI window size
+    int  win_h   = 600;
 };
 
 std::string config_path();            // full path to the config file

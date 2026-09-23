@@ -99,14 +99,14 @@ $CC  $CFLAGS -DOPLTYPE_IS_OPL3 -c "$SCRIPT_DIR/src/emu/opl.c"        -o "$OBJ_DI
 $CC  $CFLAGS                   -c "$SCRIPT_DIR/src/retrowave_serial.c" -o "$OBJ_DIR/retrowave_serial.o"
 
 # C++ sources.
-for u in playlist alsamidi config engine fanout_chip gui main; do
+for u in playlist alsamidi config board_writer engine fanout_chip gui main; do
     $CXX $CXXFLAGS $INC -c "$SCRIPT_DIR/src/$u.cpp" -o "$OBJ_DIR/$u.o"
 done
 
 # Link (-lasound for the external ALSA MIDI output).
 $CXX $CXXFLAGS -o "$BIN" \
     "$OBJ_DIR/opl.o" "$OBJ_DIR/retrowave_serial.o" \
-    "$OBJ_DIR/playlist.o" "$OBJ_DIR/alsamidi.o" "$OBJ_DIR/config.o" \
+    "$OBJ_DIR/playlist.o" "$OBJ_DIR/alsamidi.o" "$OBJ_DIR/config.o" "$OBJ_DIR/board_writer.o" \
     "$OBJ_DIR/engine.o" "$OBJ_DIR/fanout_chip.o" "$OBJ_DIR/gui.o" "$OBJ_DIR/main.o" \
     -L"$INSTALL_DIR/lib" -lADLMIDI $SDL_LIBS -lasound -lm -lpthread
 

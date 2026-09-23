@@ -44,6 +44,10 @@ public:
     // (d1 ignored for 1-byte messages). No-op when closed.
     void send(uint8_t type, uint8_t channel, uint8_t d0, uint8_t d1);
 
+    // Forward one SysEx message (complete, starting 0xF0 ... ending 0xF7; or
+    // raw bytes from an F7 escape). No-op when closed.
+    void send_sysex(const uint8_t *data, size_t len);
+
     // All-sound-off + all-notes-off + reset-controllers on every channel, to
     // clear hanging notes on stop / track change / when switching away.
     void panic();

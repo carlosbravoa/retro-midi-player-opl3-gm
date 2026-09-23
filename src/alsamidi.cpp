@@ -7,6 +7,31 @@
 #include <cstdio>
 #include <cstring>
 
+// Walk the external MIDI destinations: WRITE-capable, exported ports that
+// aren't ours, the system client, or "Midi Through". Calls fn(client, port,
+// client_name) for each; stops early if fn returns false.
+template <class Fn>
+static void scan_destinations(snd_seq_t *seq, Fn fn)
+{
+    snd_seq_client_info_t *cinfo; snd_seq_client_info_alloca(&cinfo);
+    snd_seq_port_info_t   *pinfo; snd_seq_port_info_alloca(&pinfo);
+    int me = snd_seq_client_id(seq);
+    snd_seq_client_info_set_client(cinfo, -1);
+    while (snd_seq_query_next_client(seq, cinfo) >= 0) {
+        int client = snd_seq_client_info_get_client(cinfo);
+        if (client == me || client == SND_SEQ_CLIENT_SYSTEM) continue;
+        const char *cname = snd_seq_client_info_get_name(cinfo);
+        if (strstr(cname, "Through")) continue;
+        snd_seq_port_info_set_client(pinfo, client);
+        snd_seq_port_info_set_port(pinfo, -1);
+        while (snd_seq_query_next_port(seq, pinfo) >= 0) {
+            unsigned caps = snd_seq_port_info_get_capability(pinfo);
+            if ((caps & SND_SEQ_PORT_CAP_WRITE) && !(caps & SND_SEQ_PORT_CAP_NO_EXPORT))
+                if (!fn(client, snd_seq_port_info_get_port(pinfo), cname)) return;
+        }
+    }
+}
+
 bool AlsaMidi::open(const std::string &port)
 {
     close();
@@ -36,29 +61,14 @@ bool AlsaMidi::open(const std::string &port)
             return false;
         }
     } else {
-        // Auto-pick: first WRITE-capable port that isn't ours, the system
-        // client, or "Midi Through".
+        // Auto-pick: the first external destination.
         bool found = false;
-        snd_seq_client_info_t *cinfo; snd_seq_client_info_alloca(&cinfo);
-        snd_seq_port_info_t   *pinfo; snd_seq_port_info_alloca(&pinfo);
-        int me = snd_seq_client_id(seq);
-        snd_seq_client_info_set_client(cinfo, -1);
-        while (!found && snd_seq_query_next_client(seq, cinfo) >= 0) {
-            int client = snd_seq_client_info_get_client(cinfo);
-            if (client == me || client == SND_SEQ_CLIENT_SYSTEM) continue;
-            if (strstr(snd_seq_client_info_get_name(cinfo), "Through")) continue;
-            snd_seq_port_info_set_client(pinfo, client);
-            snd_seq_port_info_set_port(pinfo, -1);
-            while (snd_seq_query_next_port(seq, pinfo) >= 0) {
-                unsigned caps = snd_seq_port_info_get_capability(pinfo);
-                if ((caps & SND_SEQ_PORT_CAP_WRITE) && !(caps & SND_SEQ_PORT_CAP_NO_EXPORT)) {
-                    dest.client = client;
-                    dest.port   = snd_seq_port_info_get_port(pinfo);
-                    found = true;
-                    break;
-                }
-            }
-        }
+        scan_destinations(seq, [&](int client, int p, const char *) {
+            dest.client = (unsigned char)client;
+            dest.port   = (unsigned char)p;
+            found = true;
+            return false;
+        });
         if (!found) {
             fprintf(stderr, "alsamidi: no external MIDI port found (try --list-midi / -m)\n");
             snd_seq_close(seq);
@@ -121,6 +131,18 @@ void AlsaMidi::send(uint8_t type, uint8_t channel, uint8_t d0, uint8_t d1)
     snd_seq_event_output_direct(m_seq, &ev);
 }
 
+void AlsaMidi::send_sysex(const uint8_t *data, size_t len)
+{
+    if (!m_seq || !data || len == 0) return;
+    snd_seq_event_t ev;
+    snd_seq_ev_clear(&ev);
+    snd_seq_ev_set_source(&ev, m_port);
+    snd_seq_ev_set_subs(&ev);
+    snd_seq_ev_set_direct(&ev);
+    snd_seq_ev_set_sysex(&ev, (unsigned)len, const_cast<uint8_t *>(data));
+    snd_seq_event_output_direct(m_seq, &ev);
+}
+
 void AlsaMidi::panic()
 {
     if (!m_seq) return;
@@ -145,55 +167,18 @@ std::vector<MidiPort> AlsaMidi::enumerate()
     snd_seq_t *seq = nullptr;
     if (snd_seq_open(&seq, "default", SND_SEQ_OPEN_OUTPUT, 0) < 0)
         return out;
-    int me = snd_seq_client_id(seq);
-    snd_seq_client_info_t *cinfo; snd_seq_client_info_alloca(&cinfo);
-    snd_seq_port_info_t   *pinfo; snd_seq_port_info_alloca(&pinfo);
-    snd_seq_client_info_set_client(cinfo, -1);
-    while (snd_seq_query_next_client(seq, cinfo) >= 0) {
-        int client = snd_seq_client_info_get_client(cinfo);
-        if (client == me || client == SND_SEQ_CLIENT_SYSTEM) continue;
-        const char *cname = snd_seq_client_info_get_name(cinfo);
-        if (strstr(cname, "Through")) continue;
-        snd_seq_port_info_set_client(pinfo, client);
-        snd_seq_port_info_set_port(pinfo, -1);
-        while (snd_seq_query_next_port(seq, pinfo) >= 0) {
-            unsigned caps = snd_seq_port_info_get_capability(pinfo);
-            if ((caps & SND_SEQ_PORT_CAP_WRITE) && !(caps & SND_SEQ_PORT_CAP_NO_EXPORT)) {
-                int p = snd_seq_port_info_get_port(pinfo);
-                char addr[16]; snprintf(addr, sizeof addr, "%d:%d", client, p);
-                out.push_back(MidiPort{ addr, std::string(cname) + " " + addr });
-            }
-        }
-    }
+    scan_destinations(seq, [&](int client, int port, const char *cname) {
+        char addr[16]; snprintf(addr, sizeof addr, "%d:%d", client, port);
+        out.push_back(MidiPort{ addr, std::string(cname) + " " + addr });
+        return true;
+    });
     snd_seq_close(seq);
     return out;
 }
 
 bool AlsaMidi::any_available()
 {
-    snd_seq_t *seq = nullptr;
-    if (snd_seq_open(&seq, "default", SND_SEQ_OPEN_OUTPUT, 0) < 0)
-        return false;
-    int me = snd_seq_client_id(seq);
-    bool found = false;
-    snd_seq_client_info_t *cinfo; snd_seq_client_info_alloca(&cinfo);
-    snd_seq_port_info_t   *pinfo; snd_seq_port_info_alloca(&pinfo);
-    snd_seq_client_info_set_client(cinfo, -1);
-    while (!found && snd_seq_query_next_client(seq, cinfo) >= 0) {
-        int client = snd_seq_client_info_get_client(cinfo);
-        if (client == me || client == SND_SEQ_CLIENT_SYSTEM) continue;
-        if (strstr(snd_seq_client_info_get_name(cinfo), "Through")) continue;
-        snd_seq_port_info_set_client(pinfo, client);
-        snd_seq_port_info_set_port(pinfo, -1);
-        while (snd_seq_query_next_port(seq, pinfo) >= 0) {
-            unsigned caps = snd_seq_port_info_get_capability(pinfo);
-            if ((caps & SND_SEQ_PORT_CAP_WRITE) && !(caps & SND_SEQ_PORT_CAP_NO_EXPORT)) {
-                found = true; break;
-            }
-        }
-    }
-    snd_seq_close(seq);
-    return found;
+    return !enumerate().empty();
 }
 
 void AlsaMidi::list_ports()

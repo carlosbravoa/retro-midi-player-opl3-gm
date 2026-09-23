@@ -51,6 +51,37 @@ extern std::atomic<bool> g_gm_out;
 // for the visualizer without tapping the stream. Benign cross-thread reads.
 extern volatile uint8_t g_opl_regs[512];
 
+// Per-OPL3-channel mute (bit N = 2-op channel N, 0..17). A muted channel has
+// its key-on bit forced off on the way to *both* sinks (and, for channels 6-8
+// in rhythm mode, the matching 0xBD drum bits), so it goes silent on the board
+// and in the emulator alike. g_opl_regs keeps the unmasked values, so unmuting
+// can re-key a note that is still being held.
+extern std::atomic<uint32_t> g_opl_mute;
+
+// Pause hold: while set, every channel is masked as if muted (same key-off
+// path), so pausing silences held notes on the board and resume re-keys them.
+extern std::atomic<bool> g_opl_hold;
+
+// Apply the mute mask to one register write (returns the value to send).
+uint8_t fanout_mask(uint16_t addr, uint8_t data);
+
+// Send one (already masked) write to the enabled sinks, bypassing the shadow.
+void fanout_send(uint16_t addr, uint8_t data);
+
+// Re-send every channel's key register (0xB0-0xB8, both sets) and 0xBD through
+// the mute mask, so a mute/unmute takes effect immediately. Audio lock held.
+void fanout_rekey();
+
+// Replay the whole register shadow to the board, in an order a freshly reset
+// OPL3 accepts (mode regs, operators, pitch/feedback, then key-on). Used when
+// board output is switched on mid-song, so the board gets the OPL3-mode enable
+// and patch setup it missed. Audio lock held; requires retrowave_active.
+void fanout_replay_to_board();
+
+// Drop every key-on bit from the shadow (after stop), so a later replay does
+// not resurrect notes of a song that is no longer playing.
+void fanout_clear_keys();
+
 class FanoutOPL3 final : public OPLChipBaseT<FanoutOPL3>
 {
 public:
@@ -79,9 +110,7 @@ public:
     void writeReg(uint16_t addr, uint8_t data) override
     {
         if (addr < 512) g_opl_regs[addr] = data;
-        if (retrowave_active && g_board_out.load(std::memory_order_relaxed))
-            retrowave_write(addr, data);
-        adlib_write(addr, data);
+        fanout_send(addr, fanout_mask(addr, data));
     }
 
     void nativePreGenerate()  override { }

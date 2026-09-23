@@ -7,7 +7,8 @@
  * highlighted, click to play, wheel to scroll) and the extra controls this
  * player needs — output routing (PC / Board / External MIDI), a picker that is
  * the FM bank list for Board/PC and the ALSA device list in External mode, a
- * shuffle toggle, a recurse toggle, and an "Open Folder" button (zenity/kdialog).
+ * shuffle toggle, a recurse toggle, an "Open Folder" button (zenity/kdialog),
+ * a click-to-seek progress bar, and per-OPL3-channel mute/solo on the bars.
  */
 #include "gui.hpp"
 #include "engine.hpp"
@@ -23,10 +24,13 @@ extern "C" {
 #include <adlmidi.h>
 #include <SDL.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 
 #define NCH 18   // OPL3: 18 two-operator channels
 
@@ -104,6 +108,20 @@ void fill_tri(int x, int y, int w, int h, int dir, RGB c)
     }
 }
 
+// ── Buttons ───────────────────────────────────────────────────────────────────
+enum {
+    ACT_PREV, ACT_PLAY, ACT_NEXT, ACT_STOP, ACT_LOOP, ACT_SHUFFLE, ACT_STYLE,
+    ACT_TDN, ACT_TUP, ACT_OUTPUT, ACT_BANK_PREV, ACT_BANK_NEXT, ACT_RECURSE,
+    ACT_OPEN, ACT_MIDI_PREV, ACT_MIDI_NEXT, ACT_UNMUTE_ALL, ACT_SEEK,
+    ACT_CHAN_BASE,                // ACT_CHAN_BASE + ch => toggle OPL3 channel ch
+    ACT_ROW_BASE = ACT_CHAN_BASE + NCH   // + n => playlist row n (must stay last)
+};
+
+struct Button { SDL_Rect r; int act; };
+Button g_btn[256];
+int    g_nbtn = 0;
+void reg_button(SDL_Rect b, int act) { if (g_nbtn < 256) g_btn[g_nbtn++] = Button{ b, act }; }
+
 // ── Visualizer ────────────────────────────────────────────────────────────────
 struct VizChan { float level, peak, hue; bool on; };
 VizChan viz[NCH];
@@ -141,8 +159,33 @@ void draw_bars(int ax, int ay, int aw, int ah)
     int gap = aw / (NCH * 5); if (gap < 1) gap = 1;
     int slot = (aw - gap) / NCH, bw = slot - gap;
 
+    int mx, my; SDL_GetMouseState(&mx, &my);
     for (int ch = 0; ch < NCH; ++ch) {
         int x = ax + gap + ch * slot;
+        bool muted = g_eng->channel_muted(ch);
+        SDL_Rect hit = { x - gap / 2, ay, slot, ah + 22 };   // bar + its labels
+        bool hover = mx >= hit.x && mx < hit.x + hit.w && my >= hit.y && my < hit.y + hit.h;
+        if (hover) fill(hit.x, hit.y, hit.w, hit.h, RGB{ 30, 34, 56 });
+        reg_button(hit, ACT_CHAN_BASE + ch);
+
+        if (muted) {
+            // Silenced: its key-on is masked at the chip, so draw a greyed-out
+            // slot (the unlit meter, desaturated) and a red number + "M" tag.
+            RGB grey = { 70, 72, 84 };
+            if (style == STYLE_LED) {
+                int segs = 18, seg_h = ah / segs;
+                for (int s = 0; s < segs; ++s)
+                    fill(x, ay + ah - (s + 1) * seg_h + 1, bw, seg_h - 1, grey, 40);
+            } else {
+                fill(x, ay, bw, ah, grey, 40);
+            }
+            char lbl[4]; snprintf(lbl, sizeof lbl, "%d", ch + 1);
+            RGB red = { 220, 70, 80 };
+            draw_text(x + bw / 2 - text_w(lbl, 1) / 2, ay + ah + 4, 1, red, lbl);
+            draw_text(x + bw / 2 - text_w("M", 1) / 2, ay + ah + 13, 1, red, "M");
+            continue;
+        }
+
         float lv = viz[ch].level; if (lv > 1) lv = 1;
         float pk = viz[ch].peak;  if (pk > 1) pk = 1;
         int bh = (int)(lv * ah), by = ay + ah - bh;
@@ -184,18 +227,6 @@ void draw_bars(int ax, int ay, int aw, int ah)
     }
 }
 
-// ── Buttons ───────────────────────────────────────────────────────────────────
-enum {
-    ACT_PREV, ACT_PLAY, ACT_NEXT, ACT_STOP, ACT_LOOP, ACT_SHUFFLE, ACT_STYLE,
-    ACT_TDN, ACT_TUP, ACT_OUTPUT, ACT_BANK_PREV, ACT_BANK_NEXT, ACT_RECURSE,
-    ACT_OPEN, ACT_MIDI_PREV, ACT_MIDI_NEXT,
-    ACT_ROW_BASE   // ACT_ROW_BASE + n => click on playlist row n (must stay last)
-};
-
-struct Button { SDL_Rect r; int act; };
-Button g_btn[64];
-int    g_nbtn = 0;
-void reg_button(SDL_Rect b, int act) { if (g_nbtn < 64) g_btn[g_nbtn++] = Button{ b, act }; }
 
 enum { ICON_PREV, ICON_PLAY, ICON_PAUSE, ICON_NEXT, ICON_STOP };
 
@@ -249,6 +280,23 @@ int  g_outmode = OUT_PC;
 bool g_recurse = false;
 bool g_quit    = false;
 
+// LOOP cycles OFF -> ONE (repeat the track, done by libADLMIDI) -> ALL (the
+// playlist wraps around at the end).
+enum { LOOP_OFF, LOOP_ONE, LOOP_ALL };
+int  g_loopmode = LOOP_OFF;
+const char *LOOP_NAME[] = { "OFF", "ONE", "ALL" };
+
+int  g_click_x = 0;          // x of the click being handled (for the seek bar)
+SDL_Rect g_seek = { 0, 0, 0, 0 };   // seek bar rect (set each frame)
+
+// Open Folder runs the (blocking) zenity/kdialog on a worker thread so the
+// window keeps repainting; the main loop picks up the result.
+std::thread       g_pick_thread;
+std::atomic<bool> g_picking{false};
+std::atomic<bool> g_pick_done{false};
+std::mutex        g_pick_mx;
+std::string       g_pick_result;   // "" = cancelled / no dialog available
+
 int  g_bank = 0;      // current bank ordinal
 std::vector<MidiPort> g_midi_ports;   // external MIDI devices (for the picker)
 int  g_midi_idx = 0;  // selected device in g_midi_ports
@@ -280,10 +328,18 @@ void apply_output()
     g_eng->set_gm_out(g_outmode == OUT_EXT);
 }
 
+// Play the current track, skipping forward past unplayable files.
 void play_current()
 {
-    const Track *t = g_pl->current();
-    if (t) g_eng->load(t->path);
+    play_from_playlist(*g_eng, *g_pl, true, false);
+}
+
+// Right-click on a bar: solo that channel, or if it is already the only one
+// playing, bring every channel back.
+void solo_channel(int ch)
+{
+    uint32_t solo = ~(1u << ch) & 0x3FFFF;
+    g_eng->set_mute_mask(g_eng->mute_mask() == solo ? 0 : solo);
 }
 
 // External-MIDI device picker (shares the BANK control slot in EXT mode).
@@ -306,7 +362,7 @@ void cycle_midi(int dir)
 }
 
 // Ask the desktop for a folder (zenity/kdialog). Returns false if unavailable
-// or cancelled — the GUI then just tells the user to pass folders on the CLI.
+// or cancelled. Blocks until the dialog closes — run it via start_pick_folder.
 bool pick_folder(std::string &out)
 {
     const char *cmds[] = {
@@ -329,6 +385,41 @@ bool pick_folder(std::string &out)
     return false;
 }
 
+void start_pick_folder()
+{
+    if (g_picking) return;   // a dialog is already open
+    if (g_pick_thread.joinable()) g_pick_thread.join();
+    g_picking = true;
+    g_pick_thread = std::thread([] {
+        std::string folder;
+        bool ok = pick_folder(folder);
+        {
+            std::lock_guard<std::mutex> lk(g_pick_mx);
+            g_pick_result = ok ? folder : std::string();
+        }
+        g_pick_done = true;
+    });
+}
+
+// Main-loop side of Open Folder: add the chosen folder once the dialog closes.
+void poll_pick_folder()
+{
+    if (!g_pick_done.exchange(false)) return;
+    g_picking = false;
+    std::string folder;
+    {
+        std::lock_guard<std::mutex> lk(g_pick_mx);
+        folder = g_pick_result;
+    }
+    if (folder.empty()) {
+        fprintf(stderr, "Open Folder: cancelled, or no zenity/kdialog. Folders can also be passed on the command line.\n");
+        return;
+    }
+    bool was_empty = g_pl->empty();
+    g_pl->add_folder(folder, g_recurse);
+    if (was_empty && !g_pl->empty()) play_current();
+}
+
 void do_action(int a)
 {
     if (a >= ACT_ROW_BASE) {
@@ -336,12 +427,31 @@ void do_action(int a)
         play_current();
         return;
     }
+    if (a >= ACT_CHAN_BASE) {
+        int ch = a - ACT_CHAN_BASE;
+        g_eng->set_channel_muted(ch, !g_eng->channel_muted(ch));
+        return;
+    }
     switch (a) {
     case ACT_PREV:  if (g_pl->prev(true)) play_current(); break;
     case ACT_NEXT:  if (g_pl->next(true)) play_current(); break;
-    case ACT_PLAY:  g_eng->set_paused(!g_eng->paused()); break;
+    case ACT_PLAY:
+        // After STOP there is no song loaded: Play restarts the current track.
+        if (!g_eng->has_song()) play_current();
+        else g_eng->set_paused(!g_eng->paused());
+        break;
+    case ACT_UNMUTE_ALL: g_eng->set_mute_mask(0); break;
     case ACT_STOP:  g_eng->stop(); break;
-    case ACT_LOOP:  g_eng->set_loop(!g_eng->loop()); break;
+    case ACT_LOOP:
+        g_loopmode = (g_loopmode + 1) % 3;
+        g_eng->set_loop(g_loopmode == LOOP_ONE);
+        break;
+    case ACT_SEEK:
+        if (g_eng->has_song() && g_seek.w > 0) {
+            double f = (double)(g_click_x - g_seek.x) / g_seek.w;
+            g_eng->seek((f < 0 ? 0 : f > 1 ? 1 : f) * g_eng->length());
+        }
+        break;
     case ACT_SHUFFLE: g_pl->set_shuffle(!g_pl->shuffle()); break;
     case ACT_STYLE: style = (style + 1) % STYLE_COUNT; break;
     case ACT_TUP:   g_eng->set_tempo(g_eng->tempo() < 4.0 ? g_eng->tempo() * 1.25 : 4.0); break;
@@ -366,17 +476,7 @@ void do_action(int a)
     case ACT_MIDI_PREV: cycle_midi(-1); break;
     case ACT_MIDI_NEXT: cycle_midi(+1); break;
     case ACT_RECURSE:   g_recurse = !g_recurse; break;
-    case ACT_OPEN: {
-        std::string folder;
-        if (pick_folder(folder)) {
-            bool was_empty = g_pl->empty();
-            g_pl->add_folder(folder, g_recurse);
-            if (was_empty && !g_pl->empty()) play_current();
-        } else {
-            fprintf(stderr, "Open Folder: no zenity/kdialog. Pass folders on the command line.\n");
-        }
-        break;
-    }
+    case ACT_OPEN: start_pick_folder(); break;
     }
 }
 
@@ -457,12 +557,13 @@ void draw_controls(int W, int Hh)
     // Row 2 (transport) at the very bottom.
     int r2 = Hh - 34, bh = 26, bx = 12;
     bx = add_icon_button(bx, r2, bh, ICON_PREV, ACT_PREV, mx, my);
-    bx = add_icon_button(bx, r2, bh, g_eng->paused() ? ICON_PLAY : ICON_PAUSE, ACT_PLAY, mx, my);
+    bool playing = g_eng->has_song() && !g_eng->paused();
+    bx = add_icon_button(bx, r2, bh, playing ? ICON_PAUSE : ICON_PLAY, ACT_PLAY, mx, my);
     bx = add_icon_button(bx, r2, bh, ICON_NEXT, ACT_NEXT, mx, my);
     bx = add_icon_button(bx, r2, bh, ICON_STOP, ACT_STOP, mx, my);
     bx += 6;
-    snprintf(b, sizeof b, "LOOP:%s", g_eng->loop() ? "ON" : "OFF");
-    bx = add_button(bx, r2, bh, b, ACT_LOOP, mx, my, g_eng->loop());
+    snprintf(b, sizeof b, "LOOP:%s", LOOP_NAME[g_loopmode]);
+    bx = add_button(bx, r2, bh, b, ACT_LOOP, mx, my, g_loopmode != LOOP_OFF);
     snprintf(b, sizeof b, "SHUF:%s", g_pl->shuffle() ? "ON" : "OFF");
     bx = add_button(bx, r2, bh, b, ACT_SHUFFLE, mx, my, g_pl->shuffle());
     bx = add_button(bx, r2, bh, STYLE_SHORT[style], ACT_STYLE, mx, my);
@@ -494,14 +595,115 @@ void draw_controls(int W, int Hh)
     bx += 10;
     snprintf(b, sizeof b, "RECURSE:%s", g_recurse ? "ON" : "OFF");
     bx = add_button(bx, r1, bh, b, ACT_RECURSE, mx, my, g_recurse);
-    add_button(bx, r1, bh, "OPEN FOLDER", ACT_OPEN, mx, my);
+    bx = add_button(bx, r1, bh, g_picking ? "OPENING.." : "OPEN FOLDER", ACT_OPEN, mx, my, g_picking);
+    if (uint32_t m = g_eng->mute_mask()) {        // only shown while something is muted
+        snprintf(b, sizeof b, "UNMUTE %d", __builtin_popcount(m));
+        add_button(bx, r1, bh, b, ACT_UNMUTE_ALL, mx, my, true);
+    }
 }
 
-void handle_click(int x, int y)
+int hit_button(int x, int y)
 {
     for (int i = 0; i < g_nbtn; ++i)
         if (x >= g_btn[i].r.x && x < g_btn[i].r.x + g_btn[i].r.w &&
-            y >= g_btn[i].r.y && y < g_btn[i].r.y + g_btn[i].r.h) { do_action(g_btn[i].act); return; }
+            y >= g_btn[i].r.y && y < g_btn[i].r.y + g_btn[i].r.h) return g_btn[i].act;
+    return -1;
+}
+
+void handle_click(int x, int y, bool right)
+{
+    int a = hit_button(x, y);
+    if (a < 0) return;
+    g_click_x = x;
+    if (right) {   // right-click only means something on a channel bar (solo)
+        if (a >= ACT_CHAN_BASE && a < ACT_ROW_BASE) solo_channel(a - ACT_CHAN_BASE);
+        return;
+    }
+    do_action(a);
+}
+
+// ── Header: title, time, click-to-seek progress bar ──────────────────────────
+void draw_header(int W)
+{
+    fill(0, 0, W, 40, RGB{ 22, 22, 38 });
+
+    const Track *cur = g_pl->current();
+    double pos = g_eng->position(), len = g_eng->length();
+    char tm[32];
+    snprintf(tm, sizeof tm, "%d:%02d/%d:%02d",
+             (int)pos / 60, (int)pos % 60, (int)len / 60, (int)len % 60);
+    int tw = text_w(tm, 2);
+    draw_text(W - 12 - tw, 6, 2, RGB{ 150, 170, 210 }, tm);
+
+    std::string title = cur ? cur->name : std::string("(nothing loaded)");
+    if (!g_eng->has_song()) { if (cur) title += "  -STOPPED-"; }
+    else if (g_eng->paused()) title += "  -PAUSED-";
+    draw_text(12, 6, 2, RGB{ 240, 240, 255 }, ellipsize(title, W - 36 - tw, 2).c_str());
+
+    // Progress bar; the clickable strip is taller than the drawn one.
+    g_seek = SDL_Rect{ 12, 24, W - 24, 14 };
+    int mx, my; SDL_GetMouseState(&mx, &my);
+    bool hover = g_eng->has_song() && mx >= g_seek.x && mx < g_seek.x + g_seek.w &&
+                 my >= g_seek.y && my < g_seek.y + g_seek.h;
+    int by = 28, bh = 6;
+    fill(g_seek.x, by, g_seek.w, bh, RGB{ 34, 36, 54 });
+    if (len > 0) {
+        int done = (int)(g_seek.w * (pos / len)); if (done > g_seek.w) done = g_seek.w;
+        fill(g_seek.x, by, done, bh, hover ? RGB{ 110, 160, 230 } : RGB{ 70, 120, 200 });
+    }
+    if (hover) fill(mx - 1, by - 2, 2, bh + 4, RGB{ 230, 235, 255 });
+    reg_button(g_seek, ACT_SEEK);
+}
+
+// Test hooks (parallel RWSHOT): at frame 20, inject a wheel scroll
+// (RWSCROLLTEST=N), N output-cycle presses (RWOUTTEST=N), a channel-mute mask
+// (RWMUTE=hex), a seek-bar click (RWSEEK=fraction) and/or key presses
+// (RWKEYS=chars), so headless screenshots can verify scrolling / output
+// switching / muting / seeking / keyboard actions.
+void run_test_hooks(long frame)
+{
+    if (frame != 20) return;
+    if (const char *st = getenv("RWSCROLLTEST")) {
+        SDL_Event we; SDL_zero(we);
+        we.type = SDL_MOUSEWHEEL;
+        we.wheel.y = -atoi(st);
+        we.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+        SDL_PushEvent(&we);
+    }
+    if (const char *sk = getenv("RWSEEK")) {     // click the seek bar at a fraction
+        SDL_Event ce; SDL_zero(ce);
+        ce.type = SDL_MOUSEBUTTONDOWN;
+        ce.button.button = SDL_BUTTON_LEFT;
+        ce.button.x = g_seek.x + (int)(g_seek.w * atof(sk));
+        ce.button.y = g_seek.y + g_seek.h / 2;
+        SDL_PushEvent(&ce);
+    }
+    if (const char *mt = getenv("RWMUTE"))
+        g_eng->set_mute_mask((uint32_t)strtoul(mt, nullptr, 16));
+    if (const char *ot = getenv("RWOUTTEST"))
+        for (int k = atoi(ot); k > 0; --k) do_action(ACT_OUTPUT);
+    if (const char *keys = getenv("RWKEYS"))
+        for (const char *k = keys; *k; ++k) {
+            SDL_Event ke; SDL_zero(ke);
+            ke.type = SDL_KEYDOWN;
+            ke.key.keysym.sym = (SDL_Keycode)*k;
+            SDL_PushEvent(&ke);
+        }
+}
+
+// Headless self-capture for testing: RWSHOT=path [RWSHOT_FRAME=N] saves the
+// frame as a BMP and quits.
+void maybe_screenshot(long frame, int W, int Hh)
+{
+    const char *shot = getenv("RWSHOT");
+    if (!shot) return;
+    long target = getenv("RWSHOT_FRAME") ? atol(getenv("RWSHOT_FRAME")) : 120;
+    if (frame < target) return;
+    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, W, Hh, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (s && SDL_RenderReadPixels(ren, nullptr, SDL_PIXELFORMAT_ARGB8888, s->pixels, s->pitch) == 0)
+        SDL_SaveBMP(s, shot);
+    if (s) SDL_FreeSurface(s);
+    g_quit = true;
 }
 
 } // namespace
@@ -513,6 +715,7 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
     g_pl  = &playlist;
     g_recurse = cfg.recurse;
     g_bank    = engine.bank();
+    g_loopmode = (cfg.loop >= LOOP_OFF && cfg.loop <= LOOP_ALL) ? cfg.loop : LOOP_OFF;
 
     style = cfg.style;
     if (style < 0 || style >= STYLE_COUNT) style = STYLE_LED;
@@ -537,7 +740,8 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
         return false;
     }
     g_win = SDL_CreateWindow("OPL3 RetroWave MIDI Player",
-            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 980, 600,
+            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            cfg.win_w < 720 ? 720 : cfg.win_w, cfg.win_h < 420 ? 420 : cfg.win_h,
             SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!g_win || !ren) { fprintf(stderr, "gui: window/renderer failed\n"); return false; }
@@ -551,8 +755,9 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) { g_quit = true; }
-            else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT)
-                handle_click(e.button.x, e.button.y);
+            else if (e.type == SDL_MOUSEBUTTONDOWN &&
+                     (e.button.button == SDL_BUTTON_LEFT || e.button.button == SDL_BUTTON_RIGHT))
+                handle_click(e.button.x, e.button.y, e.button.button == SDL_BUTTON_RIGHT);
             else if (e.type == SDL_MOUSEWHEEL) {
                 int dir = (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) ? -1 : 1;
                 scroll_playlist(-e.wheel.y * dir * 3);
@@ -569,6 +774,12 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
                 case SDLK_h: do_action(ACT_SHUFFLE); break;
                 case SDLK_v: do_action(ACT_STYLE); break;
                 case SDLK_o: do_action(ACT_OUTPUT); break;
+                case SDLK_u: do_action(ACT_UNMUTE_ALL); break;
+                // Bank (or MIDI device, in External mode) previous / next.
+                case SDLK_LEFTBRACKET:
+                    do_action(g_outmode == OUT_EXT ? ACT_MIDI_PREV : ACT_BANK_PREV); break;
+                case SDLK_RIGHTBRACKET:
+                    do_action(g_outmode == OUT_EXT ? ACT_MIDI_NEXT : ACT_BANK_NEXT); break;
                 case SDLK_EQUALS: case SDLK_PLUS: case SDLK_KP_PLUS: do_action(ACT_TUP); break;
                 case SDLK_MINUS: case SDLK_KP_MINUS: do_action(ACT_TDN); break;
                 // Playlist scrolling: up/down by a row, left/right & PgUp/PgDn by a page.
@@ -582,62 +793,39 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
             }
         }
 
-        // Auto-advance when the current song finishes.
+        // Auto-advance when the current song finishes (wrapping in LOOP:ALL).
         if (engine.consume_song_ended()) {
-            if (playlist.next(false)) play_current();
-            else engine.stop();
+            bool wrap = (g_loopmode == LOOP_ALL);
+            if (!playlist.next(wrap) || !play_from_playlist(engine, playlist, wrap, false))
+                engine.stop();
         }
 
-        // Test hooks (parallel RWSHOT): at frame 20, inject a wheel scroll
-        // (RWSCROLLTEST=N) and/or N output-cycle presses (RWOUTTEST=N), so
-        // headless screenshots can verify scrolling / output switching.
-        {
-            static long tf = 0; ++tf;
-            if (tf == 20) {
-                if (const char *st = getenv("RWSCROLLTEST")) {
-                    SDL_Event we; SDL_zero(we);
-                    we.type = SDL_MOUSEWHEEL;
-                    we.wheel.y = -atoi(st);
-                    we.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
-                    SDL_PushEvent(&we);
-                }
-                if (const char *ot = getenv("RWOUTTEST"))
-                    for (int k = atoi(ot); k > 0; --k) do_action(ACT_OUTPUT);
-                if (const char *keys = getenv("RWKEYS"))   // press each char as a key
-                    for (const char *k = keys; *k; ++k) {
-                        SDL_Event ke; SDL_zero(ke);
-                        ke.type = SDL_KEYDOWN;
-                        ke.key.keysym.sym = (SDL_Keycode)*k;
-                        SDL_PushEvent(&ke);
-                    }
-            }
+        // The board went away (unplugged / wedged): carry on through the PC.
+        if (g_outmode == OUT_BOARD && !engine.board_available()) {
+            fprintf(stderr, "gui: board lost — switching output to PC\n");
+            g_outmode = OUT_PC;
+            apply_output();
         }
+
+        poll_pick_folder();
+        static long frame = 0; ++frame;
+        run_test_hooks(frame);
 
         viz_update();
         g_nbtn = 0;
 
         int W, Hh; SDL_GetRendererOutputSize(ren, &W, &Hh);
         fill(0, 0, W, Hh, RGB{ 12, 12, 20 });
-        fill(0, 0, W, 34, RGB{ 22, 22, 38 });
-
-        // Header: current track + position/length.
-        const Track *cur = playlist.current();
-        char hdr[220];
-        double pos = engine.position(), len = engine.length();
-        snprintf(hdr, sizeof hdr, "%s%s   %d:%02d/%d:%02d",
-                 cur ? cur->name.c_str() : "(nothing loaded)",
-                 engine.paused() ? "  -PAUSED-" : "",
-                 (int)pos / 60, (int)pos % 60, (int)len / 60, (int)len % 60);
-        draw_text(12, 10, 2, RGB{ 240, 240, 255 }, ellipsize(hdr, W - 24, 2).c_str());
+        draw_header(W);
 
         // Layout: playlist panel on the right, visualizer fills the rest.
         int panel_w = W / 3; if (panel_w < 260) panel_w = 260; if (panel_w > 380) panel_w = 380;
-        int px = W - panel_w - 12, py = 44;
+        int px = W - panel_w - 12, py = 48;
         int bottom = Hh - 76;                    // above the two control rows
         int mx, my; SDL_GetMouseState(&mx, &my);
         draw_playlist(px, py, panel_w, bottom - py, mx, my);
 
-        int ax = 16, ay = 46, aw = px - 16 - 16, ah = bottom - ay - 18;
+        int ax = 16, ay = 50, aw = px - 16 - 16, ah = bottom - ay - 18;
         if (aw > 40) {
             fill(ax - 5, ay - 5, aw + 10, ah + 10 + 18, RGB{ 8, 8, 14 });
             draw_bars(ax, ay, aw, ah);
@@ -646,28 +834,20 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
         draw_controls(W, Hh);
         SDL_RenderPresent(ren);
 
-        // Headless self-capture for testing: RWSHOT=path [RWSHOT_FRAME=N].
-        const char *shot = getenv("RWSHOT");
-        if (shot) {
-            static long fr = 0;
-            long target = getenv("RWSHOT_FRAME") ? atol(getenv("RWSHOT_FRAME")) : 120;
-            if (++fr >= target) {
-                SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, W, Hh, 32, SDL_PIXELFORMAT_ARGB8888);
-                if (s && SDL_RenderReadPixels(ren, nullptr, SDL_PIXELFORMAT_ARGB8888, s->pixels, s->pitch) == 0)
-                    SDL_SaveBMP(s, shot);
-                if (s) SDL_FreeSurface(s);
-                g_quit = true;
-            }
-        }
+        maybe_screenshot(frame, W, Hh);
     }
 
     // Hand the user's final settings back for persistence.
     cfg.bank    = engine.bank();
     cfg.recurse = g_recurse;
-    cfg.loop    = engine.loop();
+    cfg.loop    = g_loopmode;
     cfg.shuffle = playlist.shuffle();
     cfg.style   = style;
     cfg.outmode = g_outmode;
+    SDL_GetWindowSize(g_win, &cfg.win_w, &cfg.win_h);
+
+    // Don't wait on an Open Folder dialog the user left open.
+    if (g_pick_thread.joinable()) g_pick_thread.detach();
 
     if (ren)   SDL_DestroyRenderer(ren);
     if (g_win) SDL_DestroyWindow(g_win);

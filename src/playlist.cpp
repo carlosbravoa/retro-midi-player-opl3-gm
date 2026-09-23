@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <cctype>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
@@ -21,9 +22,13 @@ static bool is_midi(const fs::path &p)
     return ext == ".mid" || ext == ".midi";
 }
 
-static std::string stem_of(const std::string &path)
+// Absolute, normalised form, so the same file added twice (via "./x.mid" and
+// "/home/.../x.mid", or the same folder re-opened) is recognised as one track.
+static std::string norm_path(const fs::path &p)
 {
-    return fs::path(path).stem().string();
+    std::error_code ec;
+    fs::path a = fs::absolute(p, ec);
+    return (ec ? p : a).lexically_normal().string();
 }
 
 // splitmix64 — deterministic, no global RNG, seedable per instance.
@@ -45,7 +50,10 @@ void Playlist::clear()
 void Playlist::add_file(const std::string &path)
 {
     std::string keep = current() ? current()->path : std::string();
-    m_storage.push_back(Track{path, stem_of(path)});
+    std::string n = norm_path(path);
+    for(const Track &t : m_storage)
+        if(t.path == n) return;   // already listed
+    m_storage.push_back(Track{n, fs::path(n).stem().string()});
     std::sort(m_storage.begin(), m_storage.end(),
               [](const Track &a, const Track &b){ return a.path < b.path; });
     rebuild_view(keep);
@@ -56,12 +64,15 @@ int Playlist::add_folder(const std::string &folder, bool recurse)
     std::string keep = current() ? current()->path : std::string();
     int added = 0;
     std::error_code ec;
+    std::unordered_set<std::string> have;
+    for(const Track &t : m_storage) have.insert(t.path);
 
     auto consider = [&](const fs::path &p){
-        if(is_midi(p)){
-            m_storage.push_back(Track{p.string(), p.stem().string()});
-            ++added;
-        }
+        if(!is_midi(p)) return;
+        std::string n = norm_path(p);
+        if(!have.insert(n).second) return;   // already listed
+        m_storage.push_back(Track{n, p.stem().string()});
+        ++added;
     };
 
     if(recurse){

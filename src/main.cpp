@@ -17,6 +17,7 @@
 #include <SDL.h>
 
 #include <csignal>
+#include <filesystem>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -40,14 +41,16 @@ static void usage(const char *prog)
 "  -b N          Start on libADLMIDI built-in bank #N (default: a General MIDI\n"
 "                bank if present)\n"
 "  -s            Start with shuffle enabled\n"
-"  -l            Loop the current track\n"
+"  -l            Loop the current track (in the GUI, LOOP also has ALL)\n"
 "  --no-gui      Headless: stream the playlist with no window (Ctrl-C to quit)\n"
 "  --list-banks  Print libADLMIDI's built-in banks and exit\n"
 "  --list-midi   Print available external MIDI ports and exit\n"
 "  -h, --help    This help\n\n"
-"In the GUI: click a track to play it, use OUT: to switch Board / PC / External\n"
-"MIDI, the BANK < > buttons to change FM instruments (Board/PC only), SHUF/LOOP\n"
-"toggles, and OPEN FOLDER (needs zenity or kdialog) to add more music.\n", prog);
+"In the GUI: click a track to play it, click the progress bar to seek, use OUT:\n"
+"to switch Board / PC / External MIDI, BANK < > (or [ ]) to change FM\n"
+"instruments (Board/PC only), SHUF/LOOP toggles, and OPEN FOLDER (needs zenity\n"
+"or kdialog) to add more music. Click a visualizer bar to mute that OPL3\n"
+"channel, right-click to solo it, 'u' to unmute all.\n", prog);
 }
 
 // A reasonable default bank for arbitrary MIDIs: the first whose name mentions
@@ -79,7 +82,8 @@ int main(int argc, char **argv)
 
     std::string serial_dev = "ttyACM0";
     std::string midi_port;
-    bool recurse = cfg.recurse, shuffle = cfg.shuffle, loop = cfg.loop, gui = true;
+    bool recurse = cfg.recurse, shuffle = cfg.shuffle, gui = true;
+    int  loop = cfg.loop;   // 0 off, 1 track, 2 playlist
     int  bank = cfg.bank;
     std::vector<std::string> inputs;
 
@@ -89,7 +93,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-m") && i + 1 < argc) midi_port = argv[++i];
         else if (!strcmp(a, "-r")) recurse = true;
         else if (!strcmp(a, "-s")) shuffle = true;
-        else if (!strcmp(a, "-l")) loop = true;
+        else if (!strcmp(a, "-l")) loop = 1;
         else if (!strcmp(a, "-b") && i + 1 < argc) bank = atoi(argv[++i]);
         else if (!strcmp(a, "--no-gui")) gui = false;
         else if (!strcmp(a, "--list-banks")) { list_banks(); return 0; }
@@ -99,17 +103,18 @@ int main(int argc, char **argv)
         else inputs.push_back(a);
     }
 
-    if (bank < 0) bank = default_bank();
+    // -1 (unset), a typo'd -b, or a stale config entry from a libADLMIDI with
+    // more banks would index past the bank table: fall back to the default.
+    if (bank < 0 || bank >= adl_getBanksCount()) bank = default_bank();
     if ((serial_dev == "none") || serial_dev == "off") serial_dev.clear();
 
     // ── Build the playlist ────────────────────────────────────────────────────
     Playlist playlist;
     for (const auto &in : inputs) {
         // A directory is scanned; anything else is added as a file.
-        int before = (int)playlist.size();
-        int added = playlist.add_folder(in, recurse);
-        if (added == 0 && (int)playlist.size() == before)
-            playlist.add_file(in);
+        std::error_code ec;
+        if (std::filesystem::is_directory(in, ec)) playlist.add_folder(in, recurse);
+        else                                      playlist.add_file(in);
     }
     playlist.set_shuffle(shuffle);
 
@@ -131,7 +136,7 @@ int main(int argc, char **argv)
         SDL_Quit();
         return 1;
     }
-    engine.set_loop(loop);
+    engine.set_loop(loop == 1);
     // Headless has no output selector, so pick one: an explicitly-requested
     // external MIDI device wins, else the board if present, else PC.
     if (!gui) {
@@ -151,7 +156,6 @@ int main(int argc, char **argv)
     // (and, on exit, writes back for persistence).
     cfg.bank = bank; cfg.recurse = recurse; cfg.loop = loop; cfg.shuffle = shuffle;
 
-    int rc = 0;
     if (gui) {
         if (gui_run(engine, playlist, cfg)) {
             config_save(cfg);   // persist the user's final settings
@@ -164,17 +168,16 @@ int main(int argc, char **argv)
     if (!gui) {
         // ── Headless: stream the playlist to the board / PC until it ends ─────
         signal(SIGINT, on_sigint);
-        if (const Track *t = playlist.current()) {
-            printf("Playing: %s\n", t->name.c_str());
-            engine.load(t->path);
-        }
-        while (!g_int) {
-            if (engine.consume_song_ended()) {
-                if (playlist.next(false)) {
-                    const Track *t = playlist.current();
-                    printf("Playing: %s\n", t->name.c_str());
-                    engine.load(t->path);
-                } else break;
+        signal(SIGTERM, on_sigint);
+        bool wrap = (loop == 2);
+        bool playing = play_from_playlist(engine, playlist, wrap, true);
+        while (!g_int && playing) {
+            if (engine.consume_song_ended())
+                playing = playlist.next(wrap) && play_from_playlist(engine, playlist, wrap, true);
+            if (engine.board_out() && !engine.board_available()) {
+                fprintf(stderr, "Board lost — continuing on PC audio.\n");
+                engine.set_board_out(false);
+                engine.set_pc_out(true);
             }
             SDL_Delay(100);
         }
@@ -183,5 +186,5 @@ int main(int argc, char **argv)
 
     engine.shutdown();
     SDL_Quit();
-    return rc;
+    return 0;
 }

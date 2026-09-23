@@ -1,6 +1,6 @@
 name: retro-midi-player-opl3-gm
 base: core24
-version: '1.0'
+version: '1.1'
 title: OPL3 RetroWave MIDI Player
 license: AGPL-3.0-or-later
 contact: https://github.com/carlosbravoa/retro-midi-player-opl3-gm/issues

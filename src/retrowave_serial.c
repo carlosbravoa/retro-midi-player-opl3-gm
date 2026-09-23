@@ -19,16 +19,24 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
-bool retrowave_active = false;
+volatile bool retrowave_active = false;
 
 static int rw_fd = -1;
 static bool rw_dummy = false;  // dry-run: frame but don't write to hardware
+
+// Staging buffer for buffered mode (see retrowave_set_buffered).  Frames are
+// at most ~16 bytes; if a burst ever overflows it, the extra is sent directly.
+#define RW_STAGE_CAP 65536
+static bool     rw_buffered = false;
+static uint8_t  rw_stage[RW_STAGE_CAP];
+static size_t   rw_stage_len = 0;
 
 #define RW_BOARD_OPL3 0x42
 
@@ -55,28 +63,84 @@ static uint32_t rw_pack(const uint8_t *in, uint32_t len, uint8_t *out)
 	return oc;
 }
 
-// Write a logical packet (gets framed via rw_pack before hitting the wire).
+// Board lost: stop talking to it (once) so the caller can fall back to PC.
+static void rw_fail(const char *why)
+{
+	if (retrowave_active)
+		fprintf(stderr, "retrowave: board lost (%s) — board output disabled\n", why);
+	retrowave_active = false;
+}
+
+bool retrowave_send(const uint8_t *buf, size_t len)
+{
+	if (!retrowave_active)
+		return false;
+	if (rw_dummy || rw_fd < 0)
+		return true;
+
+	size_t w = 0;
+	while (w < len)
+	{
+		ssize_t rc = write(rw_fd, buf + w, len - w);
+		if (rc > 0)
+		{
+			w += (size_t)rc;
+			continue;
+		}
+		if (rc < 0 && errno == EINTR)
+			continue;
+		if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+		{
+			// USB buffer full: 2 Mbaud drains it quickly, so a long wait
+			// means the device has wedged.
+			struct pollfd pfd = { rw_fd, POLLOUT, 0 };
+			int pr = poll(&pfd, 1, 500);
+			if (pr > 0 && !(pfd.revents & (POLLERR | POLLHUP)))
+				continue;
+			rw_fail(pr == 0 ? "write timeout" : "device hung up");
+			return false;
+		}
+		rw_fail(rc < 0 ? strerror(errno) : "short write");
+		return false;
+	}
+	return true;
+}
+
+// Write a logical packet (gets framed via rw_pack before hitting the wire, or
+// staged in buffered mode).
 static void rw_raw(const uint8_t *buf, uint32_t len)
 {
-	if (rw_dummy || rw_fd < 0)
-		return;
-
 	uint8_t packed[64];
 	uint32_t plen = rw_pack(buf, len, packed);
-	uint32_t w = 0;
-	while (w < plen)
+	if (rw_buffered && rw_stage_len + plen <= RW_STAGE_CAP)
 	{
-		ssize_t rc = write(rw_fd, packed + w, plen - w);
-		if (rc > 0)
-			w += (uint32_t)rc;
-		else if (rc < 0 && errno == EINTR)
-			continue;
-		else
-		{
-			fprintf(stderr, "retrowave: serial write failed: %s\n", strerror(errno));
-			return;
-		}
+		memcpy(rw_stage + rw_stage_len, packed, plen);
+		rw_stage_len += plen;
+		return;
 	}
+	retrowave_send(packed, plen);
+}
+
+void retrowave_set_buffered(bool on)
+{
+	rw_buffered = on;
+}
+
+size_t retrowave_take(uint8_t *out, size_t cap)
+{
+	size_t n = rw_stage_len < cap ? rw_stage_len : cap;
+	if (n < rw_stage_len)   // cut on a frame boundary (frames end with 0x02)
+		while (n > 0 && rw_stage[n - 1] != 0x02)   // payload bytes all have bit0 set
+			--n;
+	memcpy(out, rw_stage, n);
+	memmove(rw_stage, rw_stage + n, rw_stage_len - n);
+	rw_stage_len -= n;
+	return n;
+}
+
+void retrowave_discard(void)
+{
+	rw_stage_len = 0;
 }
 
 static void rw_sleep_ms(long ms)
@@ -107,12 +171,13 @@ void retrowave_reset(void)
 {
 	if (!retrowave_active)
 		return;
-
+	// Always sent directly (never staged): the sleeps are part of the reset.
 	uint8_t lo[] = { RW_BOARD_OPL3, 0x12, 0xfe };
-	rw_raw(lo, sizeof(lo));
-	rw_sleep_ms(10);
 	uint8_t hi[] = { RW_BOARD_OPL3, 0x12, 0xff };
-	rw_raw(hi, sizeof(hi));
+	uint8_t packed[16];
+	retrowave_send(packed, rw_pack(lo, sizeof(lo), packed));
+	rw_sleep_ms(10);
+	retrowave_send(packed, rw_pack(hi, sizeof(hi), packed));
 	rw_sleep_ms(10);
 }
 
@@ -135,7 +200,8 @@ bool retrowave_open(const char *dev)
 	else
 		snprintf(path, sizeof(path), "/dev/%s", dev);
 
-	rw_fd = open(path, O_RDWR | O_NOCTTY);
+	// Non-blocking so a wedged device can't hang the writer (see retrowave_send).
+	rw_fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
 	if (rw_fd < 0)
 	{
 		fprintf(stderr, "retrowave: cannot open %s: %s\n", path, strerror(errno));
@@ -178,5 +244,7 @@ void retrowave_close(void)
 		rw_fd = -1;
 	}
 	rw_dummy = false;
+	rw_buffered = false;
+	rw_stage_len = 0;
 	retrowave_active = false;
 }

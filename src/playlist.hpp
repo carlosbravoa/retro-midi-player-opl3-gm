@@ -25,11 +25,13 @@ struct Track {
 class Playlist {
 public:
     // Scan `folder` for MIDI files. If recurse, descend into subfolders.
-    // Appends to the current list (call clear() first to replace). Returns the
-    // number of tracks added. Newly added tracks are sorted by path.
+    // Appends to the current list (call clear() first to replace), skipping
+    // files already listed. Returns the number of tracks added. Tracks are
+    // kept sorted by path.
     int add_folder(const std::string &folder, bool recurse);
 
     // Add a single file (any extension — the caller vouches it is a MIDI).
+    // No-op if it is already listed.
     void add_file(const std::string &path);
 
     void clear();

@@ -46,10 +46,12 @@ bool config_load(Config &c)
         int n = atoi(v.c_str());
         if      (k == "bank")    c.bank    = n;
         else if (k == "recurse") c.recurse = n != 0;
-        else if (k == "loop")    c.loop    = n != 0;
+        else if (k == "loop")    c.loop    = (n >= 0 && n <= 2) ? n : 0;
         else if (k == "shuffle") c.shuffle = n != 0;
         else if (k == "style")   c.style   = n;
         else if (k == "outmode") c.outmode = n;
+        else if (k == "win_w")   c.win_w   = n;
+        else if (k == "win_h")   c.win_h   = n;
     }
     return true;
 }
@@ -65,8 +67,10 @@ void config_save(const Config &c)
     f << "# OPL3 RetroWave MIDI Player — saved settings\n";
     f << "bank="    << c.bank        << "\n";
     f << "recurse=" << (c.recurse ? 1 : 0) << "\n";
-    f << "loop="    << (c.loop ? 1 : 0)    << "\n";
+    f << "loop="    << c.loop        << "\n";
     f << "shuffle=" << (c.shuffle ? 1 : 0) << "\n";
     f << "style="   << c.style       << "\n";
     f << "outmode=" << c.outmode     << "\n";
+    f << "win_w="   << c.win_w       << "\n";
+    f << "win_h="   << c.win_h       << "\n";
 }
