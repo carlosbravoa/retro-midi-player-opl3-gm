@@ -7,6 +7,32 @@
 #include <cstdio>
 #include <cstring>
 
+// Open the ALSA sequencer for output. Normally via the system ALSA config; if
+// that fails, retry with a minimal built-in config. The sequencer needs nothing
+// from the system config, but loading it can fail outright: a custom
+// /etc/asound.conf that a confined snap may not read (AppArmor denies the open,
+// and ALSA aborts the whole config load), or a broken ~/.asoundrc.
+static int open_seq(snd_seq_t **seq)
+{
+    if (snd_seq_open(seq, "default", SND_SEQ_OPEN_OUTPUT, 0) >= 0)
+        return 0;
+    snd_config_t *conf = nullptr;
+    snd_input_t  *in   = nullptr;
+    static const char minimal[] = "seq.default { type hw }\n";
+    int err = snd_config_top(&conf);
+    if (err >= 0) err = snd_input_buffer_open(&in, minimal, sizeof minimal - 1);
+    if (err >= 0) err = snd_config_load(conf, in);
+    if (in) snd_input_close(in);
+    if (err >= 0) err = snd_seq_open_lconf(seq, "default", SND_SEQ_OPEN_OUTPUT, 0, conf);
+    if (conf) snd_config_delete(conf);
+    static bool noted = false;   // enumerate() reopens often; say it once
+    if (err >= 0 && !noted) {
+        fprintf(stderr, "alsamidi: system ALSA config unusable; using a built-in one for MIDI\n");
+        noted = true;
+    }
+    return err;
+}
+
 // Walk the external MIDI destinations: WRITE-capable, exported ports that
 // aren't ours, the system client, or "Midi Through". Calls fn(client, port,
 // client_name) for each; stops early if fn returns false.
@@ -37,7 +63,7 @@ bool AlsaMidi::open(const std::string &port)
     close();
 
     snd_seq_t *seq = nullptr;
-    if (snd_seq_open(&seq, "default", SND_SEQ_OPEN_OUTPUT, 0) < 0) {
+    if (open_seq(&seq) < 0) {
         fprintf(stderr, "alsamidi: cannot open ALSA sequencer\n");
         return false;
     }
@@ -165,7 +191,7 @@ std::vector<MidiPort> AlsaMidi::enumerate()
 {
     std::vector<MidiPort> out;
     snd_seq_t *seq = nullptr;
-    if (snd_seq_open(&seq, "default", SND_SEQ_OPEN_OUTPUT, 0) < 0)
+    if (open_seq(&seq) < 0)
         return out;
     scan_destinations(seq, [&](int client, int port, const char *cname) {
         char addr[16]; snprintf(addr, sizeof addr, "%d:%d", client, port);
@@ -184,7 +210,7 @@ bool AlsaMidi::any_available()
 void AlsaMidi::list_ports()
 {
     snd_seq_t *seq = nullptr;
-    if (snd_seq_open(&seq, "default", SND_SEQ_OPEN_OUTPUT, 0) < 0) {
+    if (open_seq(&seq) < 0) {
         fprintf(stderr, "alsamidi: cannot open ALSA sequencer\n");
         return;
     }

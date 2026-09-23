@@ -1,28 +1,41 @@
 name: retro-midi-player-opl3-gm
 base: core24
-version: '1.1.1'
+version: '1.1.2'
 title: OPL3 RetroWave MIDI Player
 license: AGPL-3.0-or-later
 contact: https://github.com/carlosbravoa/retro-midi-player-opl3-gm/issues
 issues: https://github.com/carlosbravoa/retro-midi-player-opl3-gm/issues
 source-code: https://github.com/carlosbravoa/retro-midi-player-opl3-gm
 website: https://github.com/carlosbravoa/retro-midi-player-opl3-gm
-summary: Play MIDI on a RetroWave OPL3 board, PC speakers, or external MIDI
+summary: MIDI player for PC speakers, a RetroWave OPL3 board or a MIDI synth
 description: |
-  A GUI player that turns Standard MIDI files into OPL3 FM synthesis (via
-  libADLMIDI) and streams them to a RetroWave OPL3 Express board over
-  USB-serial, to your PC's speakers, or — as raw MIDI — to an external
-  hardware synth (a General MIDI module) through ALSA.
+  A MIDI file player with three ways to hear your music. Pick one with the
+  OUT button and switch at any time, even mid-song:
 
-  Features a Winamp-style playlist with folder loading and shuffle, a live
-  OPL3 channel visualizer (LED / neon / spectrum), a picker for libADLMIDI's
-  built-in FM banks (or ALSA MIDI devices in external mode), and settings that
-  persist between runs.
+  - **PC speakers**: authentic Yamaha OPL3 FM sound, the Sound Blaster-era
+    chip of 90s PC games, synthesized with libADLMIDI and an accurate OPL3
+    emulator. No extra hardware needed.
+  - **RetroWave OPL3 Express board**: the same FM synthesis played on a real
+    YMF262 chip over USB, register for register, for genuine hardware sound.
+  - **External MIDI synth**: the original MIDI (including SysEx) sent through
+    ALSA to a General MIDI module or synth (Roland SC-55, Yamaha MU, etc.),
+    which plays it with its own voices.
 
-  After installing, connect the hardware interfaces the player needs:
-    snap connect retro-midi-player-opl3-gm:serial-port   # the RetroWave OPL3 board
-    snap connect retro-midi-player-opl3-gm:alsa          # an external MIDI device
-  PC audio, display and home-folder access connect automatically.
+  **Features**
+  - Dozens of built-in OPL3 instrument banks from classic games and sound
+    drivers (AIL, HMI, DMX, Apogee, Windows 9x and more), switchable while a
+    song plays
+  - Live 18-channel OPL3 visualizer in three styles (LED, neon, spectrum).
+    Click a channel to mute it, right-click to solo it
+  - Winamp-style playlist: load whole folders (optionally with subfolders),
+    shuffle, repeat one track or the whole list, click the progress bar to seek
+  - Tempo control, keyboard shortcuts, and settings that are remembered
+    between runs
+
+  PC audio, display and home-folder access work automatically. For the board
+  or an external synth, connect the matching interface once:
+    snap connect retro-midi-player-opl3-gm:serial-port   # RetroWave OPL3 board
+    snap connect retro-midi-player-opl3-gm:alsa          # external MIDI device
 
 confinement: strict
 grade: stable
