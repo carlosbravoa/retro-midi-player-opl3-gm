@@ -10,13 +10,19 @@
  * shuffle toggle, a recurse toggle, an "Open Folder" button (zenity/kdialog),
  * a click-to-seek progress bar, per-OPL3-channel mute/solo on the bars, and a
  * PORT dialog that picks the board's serial device (detected USB-serial ports,
- * or any typed path) and reopens the board on it without restarting.
+ * or any typed path) and reopens the board on it without restarting. Also:
+ * drag-and-drop of files/folders, find-as-you-type in the playlist ('/'), a PC
+ * volume control, and automatic return to the board when it is plugged back in.
+ *
+ * The control bar is a flow layout: items wrap onto extra rows when the window
+ * is too narrow, and the playlist/visualizer shrink to make room.
  */
 #include "gui.hpp"
 #include "engine.hpp"
 #include "playlist.hpp"
 #include "fanout_chip.hpp"
 #include "config.hpp"
+#include "serial_ports.hpp"
 
 extern "C" {
 #include "emu/opl.h"
@@ -32,7 +38,6 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -75,21 +80,29 @@ void fill(int x, int y, int w, int h, RGB c, Uint8 a = 255)
     SDL_RenderFillRect(ren, &q);
 }
 
+// One SDL call per string: lit pixels are merged into horizontal runs and
+// drawn as a single batch of rects (this is the bulk of every frame).
 void draw_text(int x, int y, int s, RGB c, const char *txt)
 {
-    SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, 255);
+    static std::vector<SDL_Rect> rects;
+    rects.clear();
     int cx = x;
     for (const char *p = txt; *p; ++p) {
         const uint8_t *g = font_glyph(*p);
         if (g)
             for (int ry = 0; ry < FONT_H; ++ry)
-                for (int rx = 0; rx < FONT_W; ++rx)
-                    if (g[ry] & (1 << (FONT_W - 1 - rx))) {
-                        SDL_Rect q = { cx + rx * s, y + ry * s, s, s };
-                        SDL_RenderFillRect(ren, &q);
-                    }
+                for (int rx = 0; rx < FONT_W; ) {
+                    if (!(g[ry] & (1 << (FONT_W - 1 - rx)))) { ++rx; continue; }
+                    int end = rx + 1;
+                    while (end < FONT_W && (g[ry] & (1 << (FONT_W - 1 - end)))) ++end;
+                    rects.push_back(SDL_Rect{ cx + rx * s, y + ry * s, (end - rx) * s, s });
+                    rx = end;
+                }
         cx += (FONT_W + 1) * s;
     }
+    if (rects.empty()) return;
+    SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, 255);
+    SDL_RenderFillRects(ren, rects.data(), (int)rects.size());
 }
 int text_w(const char *t, int s) { return (int)strlen(t) * (FONT_W + 1) * s; }
 
@@ -122,6 +135,8 @@ enum {
     ACT_NOP,                      // swallows clicks (the port dialog's panel)
     ACT_PORT,                     // open / close the board-port dialog
     ACT_PORT_CLOSE, ACT_PORT_RESCAN, ACT_PORT_NONE, ACT_PORT_CUSTOM,
+    ACT_VDN, ACT_VUP,             // PC volume
+    ACT_CLEAR,                    // empty the playlist
     ACT_CHAN_BASE,                // ACT_CHAN_BASE + ch => toggle OPL3 channel ch
     ACT_PORTSEL_BASE = ACT_CHAN_BASE + NCH,      // + n => detected port n
     ACT_ROW_BASE = ACT_PORTSEL_BASE + 32   // + n => playlist row n (must stay last)
@@ -307,6 +322,18 @@ std::atomic<bool> g_pick_done{false};
 std::mutex        g_pick_mx;
 std::string       g_pick_result;   // "" = cancelled / no dialog available
 
+// The board dropped out (or wasn't there at startup) while it was the wanted
+// output: go back to it by ourselves when it reappears. Cleared as soon as the
+// user picks an output or a port themselves.
+bool g_resume_board = false;
+
+std::string g_last_folder;            // most recent folder added (saved on exit)
+std::vector<std::string> g_dropped;   // files/folders of a drop in progress
+
+// Text typed while a text field is up (port dialog, playlist find) must not
+// include the key press that opened it.
+Uint32 g_text_open_ts = 0;
+
 int  g_bank = 0;      // current bank ordinal
 std::vector<MidiPort> g_midi_ports;   // external MIDI devices (for the picker)
 int  g_midi_idx = 0;  // selected device in g_midi_ports
@@ -371,6 +398,36 @@ void cycle_midi(int dir)
     g_eng->connect_midi(g_midi_ports[g_midi_idx].addr);
 }
 
+// Add folders (scanned) and files to the playlist — from Open Folder or a
+// drag-and-drop. An empty playlist starts playing what was added.
+void add_music(const std::vector<std::string> &paths)
+{
+    bool was_empty = g_pl->empty();
+    std::vector<std::string> files;
+    for (const std::string &p : paths) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(p, ec)) {
+            g_pl->add_folder(p, g_recurse);
+            g_last_folder = p;
+        } else {
+            files.push_back(p);
+        }
+    }
+    g_pl->add_files(files);
+    if (was_empty && !g_pl->empty()) {
+        g_pl->reshuffle(false);   // nothing was playing: random start in shuffle
+        play_current();
+    }
+}
+
+// A finished drag-and-drop: add everything that was dropped.
+void finish_drop()
+{
+    if (g_dropped.empty()) return;
+    add_music(g_dropped);
+    g_dropped.clear();
+}
+
 // Ask the desktop for a folder (zenity/kdialog). Returns false if unavailable
 // or cancelled. Blocks until the dialog closes — run it via start_pick_folder.
 bool pick_folder(std::string &out)
@@ -425,9 +482,7 @@ void poll_pick_folder()
         fprintf(stderr, "Open Folder: cancelled, or no zenity/kdialog. Folders can also be passed on the command line.\n");
         return;
     }
-    bool was_empty = g_pl->empty();
-    g_pl->add_folder(folder, g_recurse);
-    if (was_empty && !g_pl->empty()) play_current();
+    add_music({ folder });
 }
 
 // ── Board serial-port dialog ──────────────────────────────────────────────────
@@ -435,12 +490,10 @@ void poll_pick_folder()
 // with their USB product names) plus a text field for any other path. Picking
 // one reopens the board there and switches the output to it; the choice is
 // saved in the config.
-struct SerialPort { std::string name, desc; };   // name: "ttyUSB1"
 std::vector<SerialPort> g_ports;
 bool        g_port_dlg = false;
 std::string g_port_text;          // the custom-path field
 std::string g_port_msg;           // why the last attempt failed
-Uint32      g_port_open_ts = 0;   // timestamp of the key press that opened it
 
 // A device as the user thinks of it: without the "/dev/" prefix.
 std::string short_dev(const std::string &d)
@@ -448,28 +501,24 @@ std::string short_dev(const std::string &d)
     return d.rfind("/dev/", 0) == 0 ? d.substr(5) : d;
 }
 
+// The kernel name ("ttyUSB1") the board's device resolves to right now, ""
+// with no board configured. Cached: this is asked every frame.
+std::string board_tty()
+{
+    static std::string for_dev, tty;
+    static Uint32 at = 0;
+    const std::string &dev = g_eng->board_dev();
+    Uint32 now = SDL_GetTicks();
+    if (dev != for_dev || now - at > 1000) {
+        for_dev = dev; at = now;
+        tty = (dev.empty() || dev == "-") ? dev : serial_dev_tty(dev);
+    }
+    return tty;
+}
+
 void refresh_ports()
 {
-    g_ports.clear();
-    std::error_code ec;
-    for (std::filesystem::directory_iterator it("/dev", ec), end; !ec && it != end; it.increment(ec)) {
-        std::string n = it->path().filename().string();
-        if (n.rfind("ttyACM", 0) != 0 && n.rfind("ttyUSB", 0) != 0) continue;
-        // The USB product string sits one (CDC-ACM) or two (usb-serial) levels
-        // above the tty's device node. Unreadable (e.g. sandboxed) => no name.
-        std::string desc;
-        for (const char *rel : { "/device/../product", "/device/../../product" }) {
-            std::ifstream f("/sys/class/tty/" + n + rel);
-            if (f && std::getline(f, desc) && !desc.empty()) break;
-            desc.clear();
-        }
-        g_ports.push_back(SerialPort{ n, desc });
-    }
-    // ttyACM* before ttyUSB*, each in numeric order (ttyUSB2 before ttyUSB10).
-    std::sort(g_ports.begin(), g_ports.end(), [](const SerialPort &a, const SerialPort &b) {
-        int c = a.name.compare(0, 6, b.name, 0, 6);
-        return c ? c < 0 : atoi(a.name.c_str() + 6) < atoi(b.name.c_str() + 6);
-    });
+    g_ports = serial_ports_enumerate();
     if (g_ports.size() > 32) g_ports.resize(32);   // ACT_PORTSEL_BASE range
 }
 
@@ -486,8 +535,9 @@ void open_port_dialog()
     // Start the custom field on the current device when it's one the list
     // can't offer (a symlink, another driver's name, ...).
     g_port_text = g_eng->board_dev();
+    std::string tty = g_port_text.empty() ? std::string() : serial_dev_tty(g_port_text);
     for (const auto &p : g_ports)
-        if (p.name == short_dev(g_port_text)) g_port_text.clear();
+        if (p.name == tty) g_port_text.clear();
     if (g_port_text == "-") g_port_text.clear();
     g_port_dlg = true;
     SDL_StartTextInput();
@@ -496,12 +546,15 @@ void open_port_dialog()
 // Reopen the board on `dev` ("" = no board). Success switches the output to it
 // and closes the dialog; failure keeps the dialog up with the reason, and goes
 // back to the board that was working (a typo shouldn't cost you the board).
-void select_port(const std::string &dev)
+// `alt` is a second name for the same device to try (the plain tty name, when
+// `dev` is its stable by-id path and that isn't reachable, e.g. sandboxed).
+void select_port(const std::string &dev, const std::string &alt = std::string())
 {
     std::string prev = g_eng->board_dev();
     bool had_board = g_eng->board_available();
+    g_resume_board = false;   // the user is choosing: no automatic switching
 
-    if (g_eng->open_board(dev)) {
+    if (g_eng->open_board(dev) || (!alt.empty() && g_eng->open_board(alt))) {
         g_outmode = OUT_BOARD;
         apply_output();
         close_port_dialog();
@@ -530,7 +583,7 @@ void submit_custom_port()
 void port_dialog_key(const SDL_Event &e)
 {
     if (e.type == SDL_TEXTINPUT) {
-        if (e.text.timestamp == g_port_open_ts) return;   // the key that opened us
+        if (e.text.timestamp == g_text_open_ts) return;   // the key that opened us
         for (const char *c = e.text.text; *c; ++c)
             if (*c > ' ' && *c < 127 && g_port_text.size() < 200) g_port_text += *c;
         return;
@@ -551,6 +604,78 @@ void port_dialog_key(const SDL_Event &e)
     }
 }
 
+// ── Playlist find-as-you-type ─────────────────────────────────────────────────
+// '/' (or 'f') starts it; typing jumps to the first track whose name contains
+// the text, Up/Down (or Tab) step through matches, Enter plays, Esc cancels.
+bool        g_find = false;
+std::string g_find_text;
+int         g_find_idx = -1;      // display index of the match, -1 = none
+
+bool find_matches(int idx)
+{
+    auto lower = [](std::string s) { for (char &c : s) c = (char)tolower((unsigned char)c); return s; };
+    return lower(g_pl->tracks()[idx].name).find(lower(g_find_text)) != std::string::npos;
+}
+
+// Look for a match starting at display index `start`, stepping by `dir`.
+void find_from(int start, int dir)
+{
+    int n = (int)g_pl->size();
+    g_find_idx = -1;
+    if (n == 0 || g_find_text.empty()) return;
+    for (int k = 0; k < n; ++k) {
+        int idx = (((start + dir * k) % n) + n) % n;
+        if (!find_matches(idx)) continue;
+        g_find_idx = idx;
+        if (idx < g_scroll || idx >= g_scroll + g_visible_rows)   // bring it into view
+            g_scroll = idx - g_visible_rows / 2;
+        return;
+    }
+}
+
+void open_find()
+{
+    g_find = true;
+    g_find_text.clear();
+    g_find_idx = -1;
+    SDL_StartTextInput();
+}
+
+void close_find()
+{
+    g_find = false;
+    g_find_idx = -1;
+    SDL_StopTextInput();
+}
+
+void find_key(const SDL_Event &e)
+{
+    int at = g_find_idx < 0 ? 0 : g_find_idx;
+    if (e.type == SDL_TEXTINPUT) {
+        if (e.text.timestamp == g_text_open_ts) return;   // the key that opened us
+        for (const char *c = e.text.text; *c; ++c)
+            if (*c >= ' ' && *c < 127 && g_find_text.size() < 60) g_find_text += *c;
+        find_from(at, +1);   // stay on the current match while it still fits
+        return;
+    }
+    switch (e.key.keysym.sym) {
+    case SDLK_ESCAPE: close_find(); break;
+    case SDLK_BACKSPACE:
+        if (!g_find_text.empty()) g_find_text.pop_back();
+        find_from(at, +1);
+        break;
+    case SDLK_DOWN: case SDLK_TAB: find_from(at + 1, +1); break;
+    case SDLK_UP:                  find_from(at - 1, -1); break;
+    case SDLK_RETURN: case SDLK_KP_ENTER:
+        if (g_find_idx >= 0) {
+            g_pl->select_display_index(g_find_idx);
+            play_current();
+        }
+        close_find();
+        break;
+    }
+}
+
 void do_action(int a)
 {
     if (a >= ACT_ROW_BASE) {
@@ -560,7 +685,10 @@ void do_action(int a)
     }
     if (a >= ACT_PORTSEL_BASE) {
         size_t i = (size_t)(a - ACT_PORTSEL_BASE);
-        if (i < g_ports.size()) select_port(g_ports[i].name);
+        // Prefer the stable by-id name, so the choice survives renumbering.
+        if (i < g_ports.size())
+            select_port(g_ports[i].device(),
+                        g_ports[i].stable.empty() ? std::string() : g_ports[i].name);
         return;
     }
     if (a >= ACT_CHAN_BASE) {
@@ -593,6 +721,7 @@ void do_action(int a)
     case ACT_TUP:   g_eng->set_tempo(g_eng->tempo() < 4.0 ? g_eng->tempo() * 1.25 : 4.0); break;
     case ACT_TDN:   g_eng->set_tempo(g_eng->tempo() > 0.25 ? g_eng->tempo() / 1.25 : 0.25); break;
     case ACT_OUTPUT: {
+        g_resume_board = false;   // the user is choosing: no automatic switching
         // Cycle PC -> Board -> External, skipping any that isn't available.
         // Landing on External connects the device on demand (no -m needed).
         for (int step = 0; step < 3; ++step) {
@@ -618,6 +747,18 @@ void do_action(int a)
     case ACT_PORT_RESCAN: refresh_ports(); g_port_msg.clear(); break;
     case ACT_PORT_NONE:   select_port(std::string()); break;
     case ACT_PORT_CUSTOM: submit_custom_port(); break;
+    case ACT_VUP: case ACT_VDN: {   // 10% steps, 0..200%
+        int pct = (int)lroundf(g_eng->volume() * 100.0f) + (a == ACT_VUP ? 10 : -10);
+        g_eng->set_volume((pct < 0 ? 0 : pct > 200 ? 200 : pct) / 100.0f);
+        break;
+    }
+    case ACT_CLEAR:
+        g_eng->stop();
+        g_pl->clear();
+        g_last_folder.clear();   // don't bring it back on the next launch
+        g_scroll = 0;
+        if (g_find) close_find();
+        break;
     }
 }
 
@@ -632,9 +773,21 @@ void draw_playlist(int px, int py, int pw, int ph, int mx, int my)
 
     // Title strip.
     fill(px, py, pw, 20, RGB{ 26, 28, 46 });
-    char hdr[64];
-    snprintf(hdr, sizeof hdr, "PLAYLIST  %d", (int)g_pl->size());
-    draw_text(px + 6, py + 4, 2, RGB{ 200, 210, 245 }, hdr);
+    if (g_find) {
+        // The find field. Red while nothing matches.
+        bool miss = !g_find_text.empty() && g_find_idx < 0;
+        std::string t = g_find_text;
+        int maxc = (pw - 12 - text_w("FIND: _", 2)) / ((FONT_W + 1) * 2);
+        if (maxc > 0 && (int)t.size() > maxc) t = t.substr(t.size() - maxc);   // keep the tail
+        t = "FIND: " + t + (SDL_GetTicks() / 500 % 2 == 0 ? "_" : "");
+        draw_text(px + 6, py + 4, 2, miss ? RGB{ 240, 110, 110 } : RGB{ 240, 220, 120 }, t.c_str());
+    } else {
+        char hdr[64];
+        snprintf(hdr, sizeof hdr, "PLAYLIST  %d", (int)g_pl->size());
+        draw_text(px + 6, py + 4, 2, RGB{ 200, 210, 245 }, hdr);
+        const char *hint = "/ FIND";
+        draw_text(px + pw - 8 - text_w(hint, 1), py + 7, 1, RGB{ 90, 100, 140 }, hint);
+    }
 
     int list_y = py + 22, list_h = ph - 24;
     int rows = list_h / g_row_h;
@@ -666,6 +819,10 @@ void draw_playlist(int px, int py, int pw, int ph, int mx, int my)
 
         if (current)   fill(row.x, row.y, row.w, row.h, RGB{ 40, 70, 120 });
         else if (hover) fill(row.x, row.y, row.w, row.h, RGB{ 24, 28, 44 });
+        if (g_find && idx == g_find_idx) {            // the find match
+            SDL_SetRenderDrawColor(ren, 240, 220, 120, 255);
+            SDL_RenderDrawRect(ren, &row);
+        }
 
         char num[16]; snprintf(num, sizeof num, "%d", idx + 1);
         RGB nc = current ? RGB{ 210, 225, 255 } : RGB{ 90, 100, 140 };
@@ -688,65 +845,131 @@ void draw_playlist(int px, int py, int pw, int ph, int mx, int my)
     }
 }
 
-// ── Controls bar (two rows) ───────────────────────────────────────────────────
-void draw_controls(int W, int Hh)
+// ── Controls bar (flow layout) ────────────────────────────────────────────────
+// The controls are built as a list of items and laid out left to right,
+// wrapping onto a new row when the window is too narrow. build_controls() runs
+// first each frame (the rest of the layout needs the row count); draw_controls()
+// draws what it laid out.
+enum { IT_BTN, IT_ICON, IT_TEXT };
+struct Item {
+    int         kind = IT_BTN;
+    std::string label, alt;       // alt: shorter label to try before wrapping
+    int         icon = 0, act = ACT_NOP;
+    bool        active = false;
+    int         w = 0, pre = 0;   // width; extra gap before (not at a row start)
+    bool        glue = false;     // never wrap between the previous item and this
+    bool        newrow = false;   // always starts a row
+    RGB         col = { 200, 210, 245 };
+    int         x = 0, row = 0;   // set by the layout
+};
+std::vector<Item> g_items;
+int g_ctrl_rows = 2;
+const int CTRL_BH = 26, CTRL_PITCH = 32;
+
+int btn_w(const std::string &label) { return text_w(label.c_str(), 2) + 12; }
+
+void build_controls(int W)
 {
-    int mx, my; SDL_GetMouseState(&mx, &my);
+    g_items.clear();
+    auto btn = [](const std::string &l, int act, bool active = false) -> Item & {
+        Item it; it.label = l; it.act = act; it.active = active; it.w = btn_w(l);
+        g_items.push_back(it); return g_items.back();
+    };
+    auto icon = [](int type, int act) -> Item & {
+        Item it; it.kind = IT_ICON; it.icon = type; it.act = act; it.w = CTRL_BH + 6;
+        g_items.push_back(it); return g_items.back();
+    };
+    auto text = [](const std::string &l, int w, RGB col) -> Item & {
+        Item it; it.kind = IT_TEXT; it.label = l; it.w = w; it.col = col; it.glue = true;
+        g_items.push_back(it); return g_items.back();
+    };
     char b[64];
 
-    // Row 2 (transport) at the very bottom.
-    int r2 = Hh - 34, bh = 26, bx = 12;
-    bx = add_icon_button(bx, r2, bh, ICON_PREV, ACT_PREV, mx, my);
-    bool playing = g_eng->has_song() && !g_eng->paused();
-    bx = add_icon_button(bx, r2, bh, playing ? ICON_PAUSE : ICON_PLAY, ACT_PLAY, mx, my);
-    bx = add_icon_button(bx, r2, bh, ICON_NEXT, ACT_NEXT, mx, my);
-    bx = add_icon_button(bx, r2, bh, ICON_STOP, ACT_STOP, mx, my);
-    bx += 6;
-    snprintf(b, sizeof b, "LOOP:%s", LOOP_NAME[g_loopmode]);
-    bx = add_button(bx, r2, bh, b, ACT_LOOP, mx, my, g_loopmode != LOOP_OFF);
-    snprintf(b, sizeof b, "SHUF:%s", g_pl->shuffle() ? "ON" : "OFF");
-    bx = add_button(bx, r2, bh, b, ACT_SHUFFLE, mx, my, g_pl->shuffle());
-    bx = add_button(bx, r2, bh, STYLE_SHORT[style], ACT_STYLE, mx, my);
-    bx = add_button(bx, r2, bh, "T-", ACT_TDN, mx, my);
-    snprintf(b, sizeof b, "%.2fx", g_eng->tempo());
-    draw_text(bx + 2, r2 + (bh - FONT_H * 2) / 2, 2, RGB{ 150, 170, 210 }, b);
-    bx += text_w(b, 2) + 8;
-    bx = add_button(bx, r2, bh, "T+", ACT_TUP, mx, my);
-
-    // Board serial port: shows the device when there's room for it.
-    bx += 6;
-    std::string dev = short_dev(g_eng->board_dev());
-    if (size_t sl = dev.rfind('/'); sl != std::string::npos) dev = dev.substr(sl + 1);
-    std::string pl = "PORT:" + (dev.empty() ? std::string("NONE") : dev == "-" ? std::string("DRY-RUN") : dev);
-    if (bx + text_w(pl.c_str(), 2) + 12 > W - 12) pl = "PORT";
-    add_button(bx, r2, bh, pl.c_str(), ACT_PORT, mx, my, g_eng->board_available());
-
-    // Row 1 (routing / bank / library) above it.
-    int r1 = Hh - 66; bx = 12;
+    // Routing / bank / library.
     const char *om = g_outmode == OUT_PC ? "PC" : g_outmode == OUT_BOARD ? "BOARD" : "EXT-MIDI";
-    snprintf(b, sizeof b, "OUT:%s", om);
-    bx = add_button(bx, r1, bh, b, ACT_OUTPUT, mx, my);
-    bx += 4;
+    btn(std::string("OUT:") + om, ACT_OUTPUT);
 
     // In External mode the FM bank is irrelevant, so this control becomes the
     // ALSA device picker; otherwise it's the FM bank picker.
     bool ext = (g_outmode == OUT_EXT);
-    bx = add_button(bx, r1, bh, "<", ext ? ACT_MIDI_PREV : ACT_BANK_PREV, mx, my);
+    btn("<", ext ? ACT_MIDI_PREV : ACT_BANK_PREV).pre = 4;
     std::string label;
     if (ext) label = "MIDI: " + (g_eng->gm_available() ? g_eng->gm_name() : std::string("(none)"));
     else     label = std::string("BANK: ") + bank_name(g_bank);
-    draw_text(bx + 2, r1 + (bh - FONT_H * 2) / 2, 2, RGB{ 200, 210, 245 },
-              ellipsize(label, 280, 2).c_str());
-    bx += 284;
-    bx = add_button(bx, r1, bh, ">", ext ? ACT_MIDI_NEXT : ACT_BANK_NEXT, mx, my);
+    text(label, W < 900 ? 196 : 284, RGB{ 200, 210, 245 });
+    btn(">", ext ? ACT_MIDI_NEXT : ACT_BANK_NEXT).glue = true;
 
-    bx += 10;
-    snprintf(b, sizeof b, "RECURSE:%s", g_recurse ? "ON" : "OFF");
-    bx = add_button(bx, r1, bh, b, ACT_RECURSE, mx, my, g_recurse);
-    bx = add_button(bx, r1, bh, g_picking ? "OPENING.." : "OPEN FOLDER", ACT_OPEN, mx, my, g_picking);
-    if (uint32_t m = g_eng->mute_mask()) {        // only shown while something is muted
-        snprintf(b, sizeof b, "UNMUTE %d", __builtin_popcount(m));
-        add_button(bx, r1, bh, b, ACT_UNMUTE_ALL, mx, my, true);
+    btn(std::string("RECURSE:") + (g_recurse ? "ON" : "OFF"), ACT_RECURSE, g_recurse).pre = 10;
+    btn(g_picking ? "OPENING.." : "OPEN FOLDER", ACT_OPEN, g_picking);
+    btn("CLEAR", ACT_CLEAR);
+
+    // Transport.
+    bool playing = g_eng->has_song() && !g_eng->paused();
+    icon(ICON_PREV, ACT_PREV).newrow = true;
+    icon(playing ? ICON_PAUSE : ICON_PLAY, ACT_PLAY);
+    icon(ICON_NEXT, ACT_NEXT);
+    icon(ICON_STOP, ACT_STOP);
+    btn(std::string("LOOP:") + LOOP_NAME[g_loopmode], ACT_LOOP, g_loopmode != LOOP_OFF).pre = 6;
+    btn(std::string("SHUF:") + (g_pl->shuffle() ? "ON" : "OFF"), ACT_SHUFFLE, g_pl->shuffle());
+    btn(STYLE_SHORT[style], ACT_STYLE);
+
+    btn("T-", ACT_TDN);
+    snprintf(b, sizeof b, "%.2fx", g_eng->tempo());
+    text(b, text_w(b, 2) + 4, RGB{ 150, 170, 210 });
+    btn("T+", ACT_TUP).glue = true;
+
+    btn("V-", ACT_VDN).pre = 6;
+    snprintf(b, sizeof b, "%3d%%", (int)lroundf(g_eng->volume() * 100.0f));
+    text(b, text_w(b, 2) + 4, RGB{ 150, 170, 210 });
+    btn("V+", ACT_VUP).glue = true;
+
+    // Board serial port: names the device when there's room for it.
+    std::string dev = board_tty();
+    Item &port = btn("PORT:" + (dev.empty() ? std::string("NONE") : dev == "-" ? std::string("DRY-RUN") : dev),
+                     ACT_PORT, g_eng->board_available());
+    port.pre = 6;
+    port.alt = "PORT";
+
+    // Flow.
+    const int left = 12, right = W - 12, gap = 6;
+    int x = left, row = 0;
+    for (size_t i = 0; i < g_items.size(); ++i) {
+        Item &it = g_items[i];
+        if (it.newrow && x != left) { ++row; x = left; }
+        int pre = (x == left) ? 0 : it.pre;
+        if (!it.glue && x != left) {
+            int need = it.w;                         // this item + what's glued to it
+            for (size_t j = i + 1; j < g_items.size() && g_items[j].glue; ++j)
+                need += gap + g_items[j].w;
+            if (x + pre + need > right) {
+                if (!it.alt.empty() && x + pre + btn_w(it.alt) <= right) {
+                    it.label = it.alt; it.w = btn_w(it.alt);
+                } else {
+                    ++row; x = left; pre = 0;
+                }
+            }
+        }
+        x += pre;
+        it.x = x; it.row = row;
+        x += it.w + gap;
+    }
+    g_ctrl_rows = row + 1;
+}
+
+int controls_height() { return g_ctrl_rows * CTRL_PITCH + 12; }
+
+void draw_controls(int Hh)
+{
+    int mx, my; SDL_GetMouseState(&mx, &my);
+    for (const Item &it : g_items) {
+        int y = Hh - 34 - (g_ctrl_rows - 1 - it.row) * CTRL_PITCH;
+        if (it.kind == IT_BTN)
+            add_button(it.x, y, CTRL_BH, it.label.c_str(), it.act, mx, my, it.active);
+        else if (it.kind == IT_ICON)
+            add_icon_button(it.x, y, CTRL_BH, it.icon, it.act, mx, my);
+        else
+            draw_text(it.x + 2, y + (CTRL_BH - FONT_H * 2) / 2, 2, it.col,
+                      ellipsize(it.label, it.w - 4, 2).c_str());
     }
 }
 
@@ -774,6 +997,7 @@ void draw_port_dialog(int W, int Hh)
     int mx, my; SDL_GetMouseState(&mx, &my);
     fill(0, 0, W, Hh, RGB{ 0, 0, 0 }, 185);
     g_nbtn = 0;
+    reg_button(SDL_Rect{ 0, 0, W, Hh }, ACT_PORT_CLOSE);    // clicks outside it
 
     const int rh = 26, gap = 4, pad = 14;
     const int fixed = pad + 24 + (rh + gap) + 12 + 14 + rh + 16 + 22 + rh + pad;
@@ -787,6 +1011,7 @@ void draw_port_dialog(int W, int Hh)
     fill(px, py, pw, ph, RGB{ 16, 18, 30 });
     SDL_SetRenderDrawColor(ren, 110, 125, 180, 255);
     SDL_Rect frame = { px, py, pw, ph }; SDL_RenderDrawRect(ren, &frame);
+    reg_button(frame, ACT_NOP);                             // clicks on the panel
 
     int x = px + pad, w = pw - 2 * pad, y = py + pad;
     draw_text(x, y, 2, RGB{ 240, 240, 255 }, "OPL3 BOARD SERIAL PORT");
@@ -794,9 +1019,10 @@ void draw_port_dialog(int W, int Hh)
 
     // Detected devices; the one the board is on is highlighted.
     std::string cur = short_dev(g_eng->board_dev());
+    std::string cur_tty = board_tty();
     bool alive = g_eng->board_available();
     for (int i = 0; i < shown; ++i) {
-        bool is_cur = (g_ports[i].name == cur);
+        bool is_cur = (g_ports[i].name == cur_tty);
         std::string note = g_ports[i].desc;
         if (is_cur) note = (alive ? "(IN USE) " : "(NOT RESPONDING) ") + note;
         port_row(x, y, w, rh, g_ports[i].name, note, ACT_PORTSEL_BASE + i,
@@ -846,14 +1072,12 @@ void draw_port_dialog(int W, int Hh)
 
     int bx = add_button(x, y, rh, "RESCAN", ACT_PORT_RESCAN, mx, my);
     add_button(bx, y, rh, "CLOSE", ACT_PORT_CLOSE, mx, my);
-
-    reg_button(frame, ACT_NOP);                             // clicks on the panel
-    reg_button(SDL_Rect{ 0, 0, W, Hh }, ACT_PORT_CLOSE);    // clicks outside it
 }
 
+// Topmost wins: whatever was drawn (registered) last is on top.
 int hit_button(int x, int y)
 {
-    for (int i = 0; i < g_nbtn; ++i)
+    for (int i = g_nbtn - 1; i >= 0; --i)
         if (x >= g_btn[i].r.x && x < g_btn[i].r.x + g_btn[i].r.w &&
             y >= g_btn[i].r.y && y < g_btn[i].r.y + g_btn[i].r.h) return g_btn[i].act;
     return -1;
@@ -863,6 +1087,7 @@ void handle_click(int x, int y, bool right)
 {
     int a = hit_button(x, y);
     if (a < 0) return;
+    if (g_find) close_find();   // a click ends the find
     g_click_x = x;
     if (right) {   // right-click only means something on a channel bar (solo)
         if (a >= ACT_CHAN_BASE && a < ACT_PORTSEL_BASE) solo_channel(a - ACT_CHAN_BASE);
@@ -907,9 +1132,11 @@ void draw_header(int W)
 // Test hooks (parallel RWSHOT): at frame 20, inject a wheel scroll
 // (RWSCROLLTEST=N), N output-cycle presses (RWOUTTEST=N), a channel-mute mask
 // (RWMUTE=hex), a seek-bar click (RWSEEK=fraction), key presses (RWKEYS=chars)
-// and/or the port dialog (RWPORT=dev opens it and submits dev as the custom
-// path; empty just opens it), so headless screenshots can verify scrolling /
-// output switching / muting / seeking / keyboard actions / port selection.
+// the port dialog (RWPORT=dev opens it and submits dev as the custom path;
+// empty just opens it), a playlist find (RWFIND=text) and/or a drag-and-drop
+// (RWDROP=path), so headless screenshots can verify scrolling / output
+// switching / muting / seeking / keyboard actions / port selection / find /
+// drops.
 void run_test_hooks(long frame)
 {
     if (frame != 20) return;
@@ -935,6 +1162,15 @@ void run_test_hooks(long frame)
     if (const char *pt = getenv("RWPORT")) {
         open_port_dialog();
         if (*pt) { g_port_text = pt; submit_custom_port(); }
+    }
+    if (const char *ft = getenv("RWFIND")) {     // find-as-you-type for this text
+        open_find();
+        g_find_text = ft;
+        find_from(0, +1);
+    }
+    if (const char *dp = getenv("RWDROP")) {     // as if this path were dropped
+        g_dropped.push_back(dp);
+        finish_drop();
     }
     if (const char *keys = getenv("RWKEYS"))
         for (const char *k = keys; *k; ++k) {
@@ -963,11 +1199,12 @@ void maybe_screenshot(long frame, int W, int Hh)
 } // namespace
 
 // ── Public entry point ────────────────────────────────────────────────────────
-bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
+bool gui_run(Engine &engine, Playlist &playlist, Config &cfg, bool autoplay)
 {
     g_eng = &engine;
     g_pl  = &playlist;
     g_recurse = cfg.recurse;
+    g_last_folder = cfg.last_folder;
     g_bank    = engine.bank();
     g_loopmode = (cfg.loop >= LOOP_OFF && cfg.loop <= LOOP_ALL) ? cfg.loop : LOOP_OFF;
 
@@ -977,7 +1214,10 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
     // Restore the saved output mode if it's usable now, else fall back.
     int want = cfg.outmode;
     if (want < 0) want = engine.board_available() ? OUT_BOARD : OUT_PC;   // auto
-    if (want == OUT_BOARD && !engine.board_available()) want = OUT_PC;
+    if (want == OUT_BOARD && !engine.board_available()) {
+        want = OUT_PC;
+        g_resume_board = true;   // it was the choice: take it up when it's plugged in
+    }
     if (want == OUT_EXT) {
         if (engine.gm_available() || (engine.gm_connectable() && engine.ensure_midi())) {
             refresh_midi_ports(); sync_midi_idx();
@@ -1003,19 +1243,26 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_StopTextInput();   // only wanted while the port dialog is open
 
-    if (!playlist.empty() && !engine.paused())
+    if (autoplay && !playlist.empty() && !engine.paused())
         play_current();
 
+    Uint32 last_reconnect_poll = SDL_GetTicks();
     while (!g_quit) {
+        Uint32 frame_start = SDL_GetTicks();
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) { g_quit = true; }
+            else if (e.type == SDL_DROPFILE) {       // one per dropped file/folder
+                if (e.drop.file) { g_dropped.push_back(e.drop.file); SDL_free(e.drop.file); }
+            }
+            else if (e.type == SDL_DROPCOMPLETE) finish_drop();
             else if (e.type == SDL_MOUSEBUTTONDOWN &&
                      (e.button.button == SDL_BUTTON_LEFT || e.button.button == SDL_BUTTON_RIGHT))
                 handle_click(e.button.x, e.button.y, e.button.button == SDL_BUTTON_RIGHT);
             else if (g_port_dlg) {   // modal: keys go to the dialog, nothing else
                 if (e.type == SDL_KEYDOWN || e.type == SDL_TEXTINPUT) port_dialog_key(e);
             }
+            else if (g_find && (e.type == SDL_KEYDOWN || e.type == SDL_TEXTINPUT)) find_key(e);
             else if (e.type == SDL_MOUSEWHEEL) {
                 int dir = (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) ? -1 : 1;
                 scroll_playlist(-e.wheel.y * dir * 3);
@@ -1032,7 +1279,11 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
                 case SDLK_h: do_action(ACT_SHUFFLE); break;
                 case SDLK_v: do_action(ACT_STYLE); break;
                 case SDLK_o: do_action(ACT_OUTPUT); break;
-                case SDLK_d: g_port_open_ts = e.key.timestamp; do_action(ACT_PORT); break;
+                case SDLK_d: g_text_open_ts = e.key.timestamp; do_action(ACT_PORT); break;
+                case SDLK_SLASH: case SDLK_f:
+                    g_text_open_ts = e.key.timestamp; open_find(); break;
+                case SDLK_9: do_action(ACT_VDN); break;
+                case SDLK_0: do_action(ACT_VUP); break;
                 case SDLK_u: do_action(ACT_UNMUTE_ALL); break;
                 // Bank (or MIDI device, in External mode) previous / next.
                 case SDLK_LEFTBRACKET:
@@ -1064,6 +1315,17 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
             fprintf(stderr, "gui: board lost — switching output to PC\n");
             g_outmode = OUT_PC;
             apply_output();
+            g_resume_board = true;
+        }
+        // ...and come back when it does (plugged back in, or in at last).
+        if (frame_start - last_reconnect_poll >= 1000) {
+            last_reconnect_poll = frame_start;
+            if (engine.poll_board_reconnect() && g_resume_board) {
+                fprintf(stderr, "gui: board is back — switching output to it\n");
+                g_resume_board = false;
+                g_outmode = OUT_BOARD;
+                apply_output();
+            }
         }
 
         poll_pick_folder();
@@ -1076,11 +1338,12 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
         int W, Hh; SDL_GetRendererOutputSize(ren, &W, &Hh);
         fill(0, 0, W, Hh, RGB{ 12, 12, 20 });
         draw_header(W);
+        build_controls(W);   // first: how many rows it needs sets the layout
 
         // Layout: playlist panel on the right, visualizer fills the rest.
         int panel_w = W / 3; if (panel_w < 260) panel_w = 260; if (panel_w > 380) panel_w = 380;
         int px = W - panel_w - 12, py = 48;
-        int bottom = Hh - 76;                    // above the two control rows
+        int bottom = Hh - controls_height();     // above the control rows
         int mx, my; SDL_GetMouseState(&mx, &my);
         draw_playlist(px, py, panel_w, bottom - py, mx, my);
 
@@ -1088,13 +1351,22 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
         if (aw > 40) {
             fill(ax - 5, ay - 5, aw + 10, ah + 10 + 18, RGB{ 8, 8, 14 });
             draw_bars(ax, ay, aw, ah);
+            if (uint32_t m = g_eng->mute_mask()) {   // only while something is muted
+                char b[32]; snprintf(b, sizeof b, "UNMUTE %d", __builtin_popcount(m));
+                add_button(ax + aw - btn_w(b), ay, CTRL_BH, b, ACT_UNMUTE_ALL, mx, my, true);
+            }
         }
 
-        draw_controls(W, Hh);
+        draw_controls(Hh);
         if (g_port_dlg) draw_port_dialog(W, Hh);
         SDL_RenderPresent(ren);
 
         maybe_screenshot(frame, W, Hh);
+
+        // Present normally blocks for vsync. Where it doesn't (software
+        // renderer, some hidden windows) don't spin a core: hold ~60 fps.
+        Uint32 took = SDL_GetTicks() - frame_start;
+        if (took < 15) SDL_Delay(15 - took);
     }
 
     // Hand the user's final settings back for persistence.
@@ -1103,7 +1375,11 @@ bool gui_run(Engine &engine, Playlist &playlist, Config &cfg)
     cfg.loop    = g_loopmode;
     cfg.shuffle = playlist.shuffle();
     cfg.style   = style;
-    cfg.outmode = g_outmode;
+    // A board we're only waiting on is still the user's choice of output.
+    cfg.outmode = (g_resume_board && g_outmode == OUT_PC) ? (int)OUT_BOARD : g_outmode;
+    cfg.volume  = (int)lroundf(engine.volume() * 100.0f);
+    cfg.last_folder = g_last_folder;
+    if (!engine.gm_spec().empty()) cfg.midi_dev = engine.gm_spec();
     // Remember the board device (a dry run isn't a device worth remembering).
     if (engine.board_dev() != "-")
         cfg.serial_dev = engine.board_dev().empty() ? "none" : engine.board_dev();

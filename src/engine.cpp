@@ -9,8 +9,12 @@ extern "C" {
 #include "retrowave_serial.h"
 }
 
+#include "serial_ports.hpp"
+
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 
 bool Engine::init(unsigned sample_rate, const std::string &serial_dev,
                   const std::string &midi_port, int bank_no)
@@ -95,9 +99,41 @@ bool Engine::open_board(const std::string &serial_dev)
         retrowave_set_buffered(true);
         m_writer.start();
     }
+    if(m_have_board) m_reconnect_armed = false;
     if(m_dev) SDL_UnlockAudioDevice(m_dev);
     return m_have_board;
 }
+
+// Reopen the board when its device node shows up. Only "armed" after the node
+// has been seen missing (or was never opened): a board that died with its node
+// still present is wedged, and reopening it would just stall on its reset.
+// A fresh node may not have its permissions yet, hence a few attempts.
+bool Engine::poll_board_reconnect()
+{
+    if(m_serial_dev.empty() || m_serial_dev == "-") return false;
+    if(board_available()){ m_reconnect_armed = false; return false; }
+
+    if(access(serial_dev_path(m_serial_dev).c_str(), F_OK) != 0){
+        m_reconnect_armed = true;      // gone: try again when it comes back
+        m_reconnect_tries = 0;
+        return false;
+    }
+    if(!m_reconnect_armed || m_reconnect_tries >= 5) return false;
+    ++m_reconnect_tries;
+    return open_board(std::string(m_serial_dev));
+}
+
+void Engine::set_volume(float v)
+{
+    m_volume.store(v < 0.0f ? 0.0f : v > 2.0f ? 2.0f : v);
+}
+
+void Engine::set_midi_hint(const std::string &spec)
+{
+    if(m_midi_port.empty()) m_midi_port = spec;
+}
+
+std::string Engine::gm_spec() const { return m_midi.dest_spec(); }
 
 // ── Song loading (locks the audio callback out while reconfiguring) ───────────
 bool Engine::load_locked(const std::string &path)
@@ -291,7 +327,9 @@ bool Engine::ensure_midi()
 {
     if(m_have_midi) return true;
     SDL_LockAudioDevice(m_dev);
-    m_have_midi = m_midi.open(m_midi_port);   // "" => auto-pick first device
+    // The remembered/requested device first; if it's gone, any that works.
+    m_have_midi = m_midi.open(m_midi_port)
+               || (!m_midi_port.empty() && m_midi.open(""));
     SDL_UnlockAudioDevice(m_dev);
     return m_have_midi;
 }
@@ -367,6 +405,7 @@ void Engine::render(int16_t *out, int frames)
 {
     using Clock = BoardWriter::Clock;
     const bool board = m_have_board && retrowave_active && g_board_out.load();
+    const bool gm    = m_have_midi && g_gm_out.load();
     const Clock::duration block = std::chrono::duration_cast<Clock::duration>(
         std::chrono::duration<double>((double)frames / m_rate));
 
@@ -387,18 +426,24 @@ void Engine::render(int16_t *out, int frames)
 
     // adl_play advances the sequencer (firing OPL writes to board + emu) and
     // returns the emulator's samples. sampleCount is int16 values (2/frame).
-    // With the board on, render in short slices so each slice's register
-    // writes can be sent at its own time instead of in one burst per block.
-    const int slice = board ? 64 : frames;   // 64 frames ~ 1.5 ms at 44.1 kHz
+    // With the board or an external synth on, render in short slices so each
+    // slice's output goes out at its own time instead of in one burst per
+    // block: board bytes via the writer thread, MIDI events stamped for the
+    // ALSA sequencer to deliver.
+    const int slice = (board || gm) ? 64 : frames;   // 64 frames ~ 1.5 ms at 44.1 kHz
     int want = frames * 2, got = 0;
     for(int f = 0; f < frames; f += slice){
         int n = (frames - f < slice ? frames - f : slice) * 2;
+        const Clock::time_point when = base + block * f / frames;
+        if(gm) m_midi.set_delay(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    when - Clock::now()).count());
         int g = adl_play(m_adl, n, out + f * 2);
         if(g < 0) g = 0;
         got += g;
-        if(board) board_submit(base + block * f / frames);
+        if(board) board_submit(when);
         if(g < n) break;   // song end
     }
+    if(gm) m_midi.set_delay(0);   // anything sent from outside the callback: now
     m_board_clock = base + block;
     m_pos = adl_positionTell(m_adl);
     if(got < want){
@@ -413,10 +458,19 @@ void Engine::render(int16_t *out, int frames)
         return;
     }
 
-    // Emulator output is quiet; apply a modest gain with hard clipping.
+    // Emulator output is quiet: apply gain x volume. Peaks past the knee are
+    // rounded off (tanh) rather than clipped flat, so loud passages and
+    // volumes above 100% distort gently instead of crackling.
+    const float gain = kBaseGain * m_volume.load();
+    const float knee = 24000.0f, room = 32767.0f - knee;
     for(int i = 0; i < want; ++i){
-        int s = (int)(out[i] * m_gain);
-        out[i] = (int16_t)(s > 32767 ? 32767 : (s < -32768 ? -32768 : s));
+        float s = out[i] * gain;
+        float a = std::fabs(s);
+        if(a > knee){
+            a = knee + room * std::tanh((a - knee) / room);
+            s = s < 0 ? -a : a;
+        }
+        out[i] = (int16_t)s;
     }
 }
 

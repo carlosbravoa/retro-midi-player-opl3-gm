@@ -78,6 +78,21 @@ public:
     // says why.
     bool open_board(const std::string &serial_dev);
     const std::string &board_dev() const { return m_serial_dev; }   // as requested
+
+    // Call about once a second. If the board's device has (re)appeared — it
+    // was unplugged, or wasn't there at startup — reopen it. True exactly when
+    // that just succeeded (board output is still off; see open_board).
+    bool poll_board_reconnect();
+
+    // PC output volume, 0.0 .. 2.0 (1.0 = normal). Board and External MIDI
+    // have their own volume controls and are not affected.
+    void  set_volume(float v);
+    float volume() const { return m_volume.load(); }
+
+    // Device to try first when External output is connected on demand
+    // (ignored if -m already chose one). Falls back to auto-pick if it's gone.
+    void set_midi_hint(const std::string &spec);
+    std::string gm_spec() const;          // "Client name:port" to save, or ""
     bool gm_available() const;      // an external MIDI port is connected
     bool gm_connectable() const;    // connected, or one could be connected now
     bool ensure_midi();             // connect the external device if not already
@@ -128,6 +143,8 @@ private:
     bool              m_have_midi = false;
     std::string       m_cur_path;
     std::string       m_serial_dev;  // board device last asked for ("" = none)
+    bool              m_reconnect_armed = true;   // device was absent / never opened
+    int               m_reconnect_tries = 0;      // attempts since it appeared
     std::string       m_midi_port;   // configured -m target ("" = auto-pick)
     AlsaMidi          m_midi;
 
@@ -140,7 +157,8 @@ private:
     std::atomic<double> m_pos{0.0};
     std::atomic<double> m_len{0.0};
 
-    float             m_gain = 2.0f;        // emulator output runs quiet
+    std::atomic<float> m_volume{1.0f};
+    static constexpr float kBaseGain = 2.0f;   // emulator output runs quiet
 };
 
 // Play the playlist's current track, skipping forward past any file that

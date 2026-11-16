@@ -36,7 +36,7 @@ const char *retrowave_last_error(void);
 // One OPL register write.  idx 0x000-0x0FF -> first register set (port 0);
 // idx 0x100-0x1FF -> second register set (port 1).  No-op if not active.
 // Unbuffered (default): framed and written to the device immediately.
-// Buffered: the framed bytes are appended to a staging buffer instead, for the
+// Buffered: the framed bytes are appended to a (growing) staging buffer, for the
 // caller to collect with retrowave_take() and send later (paced) with
 // retrowave_send().  The staging buffer is not thread-safe: the caller
 // serialises retrowave_write / retrowave_take.

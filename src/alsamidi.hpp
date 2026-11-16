@@ -30,14 +30,24 @@ struct MidiPort {
 class AlsaMidi {
 public:
     // Open the sequencer and connect to `port`. `port` accepts ALSA address
-    // syntax ("20:0" or a client name). If empty, auto-connect to the first
-    // external MIDI destination (skipping "Midi Through" and system ports).
+    // syntax ("20:0", a client name, or "Client name:0"). If empty,
+    // auto-connect to the first external MIDI destination that accepts the
+    // connection (skipping "Midi Through" and system ports).
     // Returns false (and stays closed) on any failure.
     bool open(const std::string &port);
     void close();
     bool is_open() const { return m_seq != nullptr; }
     const std::string &dest_name() const { return m_dest_name; }
     std::string dest_addr() const;   // "client:port" of the connection, or ""
+    // "Client name:port" — survives the client being renumbered, so it is
+    // what to save and pass back to open() next time. "" when closed.
+    std::string dest_spec() const;
+
+    // Events sent from now on are delivered this far in the future (by the
+    // ALSA sequencer's own timer) instead of immediately; <= 0 = immediately.
+    // The engine renders audio in bursts, so it uses this to space each
+    // burst's events out to their real times.
+    void set_delay(long long ns) { m_delay_ns = ns; }
 
     // Forward one channel-voice event. `type` is the MIDI status high nibble
     // (0x8 note-off … 0xE pitch-wheel); `channel` 0–15; d0/d1 the data bytes
@@ -69,7 +79,12 @@ private:
     int         m_port = -1;      // our source port id
     int         m_dst_client = -1;
     int         m_dst_port   = -1;
+    int         m_queue      = -1;    // ALSA queue for delayed delivery (-1: none)
+    long long   m_delay_ns   = 0;
     std::string m_dest_name;
+    std::string m_dest_client;        // destination client name only
+
+    void deliver(void *ev, bool now);   // stamp + send one prepared event
 };
 
 #endif /* ALSAMIDI_HPP */

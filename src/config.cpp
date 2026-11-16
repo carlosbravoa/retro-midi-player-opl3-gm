@@ -53,6 +53,9 @@ bool config_load(Config &c)
         else if (k == "win_w")   c.win_w   = n;
         else if (k == "win_h")   c.win_h   = n;
         else if (k == "serial_dev") c.serial_dev = v;
+        else if (k == "volume")  c.volume  = (n >= 0 && n <= 200) ? n : 100;
+        else if (k == "midi_dev")    c.midi_dev    = v;
+        else if (k == "last_folder") c.last_folder = v;
     }
     return true;
 }
@@ -75,4 +78,7 @@ void config_save(const Config &c)
     f << "win_w="   << c.win_w       << "\n";
     f << "win_h="   << c.win_h       << "\n";
     f << "serial_dev=" << c.serial_dev << "\n";
+    f << "volume="  << c.volume      << "\n";
+    f << "midi_dev="    << c.midi_dev    << "\n";
+    f << "last_folder=" << c.last_folder << "\n";
 }

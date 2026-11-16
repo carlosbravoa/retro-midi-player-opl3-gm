@@ -164,19 +164,38 @@ opl3-rw-midi-player [options] [folder | file.mid ...]
 | `--no-gui` | Headless playback (Ctrl-C to quit) |
 | `--list-banks` | Print the FM instrument banks and exit |
 | `--list-midi` | Print available external MIDI ports and exit |
+| `--list-ports` | Print the USB-serial devices a board could be on and exit |
+| `--version` | Print the version and exit |
 
-Command-line flags override the saved settings for that run.
+Command-line flags override the saved settings for that run. Started with no
+files or folders, the GUI reloads the last folder you opened (without starting
+to play).
 
 ### GUI controls
 
 `space` play/pause · `n` next track · `p` prev track · `s` stop · `l` loop ·
 `h` shuffle · `v` visualizer style · `o` cycle output (Board/PC/EXT-MIDI) ·
-`d` board serial port · `+`/`-` tempo · `q`/`Esc` quit.
+`d` board serial port · `+`/`-` tempo · `9`/`0` volume · `/` (or `f`) find a
+track · `q`/`Esc` quit.
+
+**Adding music:** `OPEN FOLDER`, or drag files and folders onto the window.
+`CLEAR` empties the playlist. Tracks are listed in natural order (`Track 2`
+before `Track 10`).
+
+**Find:** press `/` and type part of a name — the list jumps to the first
+match. `Up`/`Down` step through the matches, `Enter` plays, `Esc` cancels.
+
+**Volume** (`V-`/`V+`) applies to the PC output only; the board and an external
+synth have their own.
 
 **Board serial port:** the `PORT` button (or `d`) lists the USB-serial devices
 that are plugged in (`ttyACM*` / `ttyUSB*`, with their USB product names). Click
 one to move the board there — it takes effect immediately, mid-song, and is
-remembered for the next run. For anything not in the list (a udev symlink, a
+remembered for the next run. The port is saved by its stable
+`/dev/serial/by-id/` name when it has one, so the board is found again even if
+it comes up as a different `ttyUSB` number. If the board is unplugged the
+player carries on through the PC and returns to the board by itself when it is
+plugged back in. For anything not in the list (a udev symlink, a
 differently named device) type its name or full path in the field and press
 Enter. Any board that speaks the RetroWave OPL3 protocol at 2 Mbaud works.
 

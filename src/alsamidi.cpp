@@ -78,46 +78,63 @@ bool AlsaMidi::open(const std::string &port)
         return false;
     }
 
-    // Resolve the destination.
-    snd_seq_addr_t dest;
+    // Candidate destinations: the one asked for, or every external one.
+    std::vector<snd_seq_addr_t> cands;
     if (!port.empty()) {
-        if (snd_seq_parse_address(seq, &dest, port.c_str()) < 0) {
+        snd_seq_addr_t a;
+        if (snd_seq_parse_address(seq, &a, port.c_str()) < 0) {
             fprintf(stderr, "alsamidi: bad MIDI port '%s' (try --list-midi)\n", port.c_str());
             snd_seq_close(seq);
             return false;
         }
+        cands.push_back(a);
     } else {
-        // Auto-pick: the first external destination.
-        bool found = false;
         scan_destinations(seq, [&](int client, int p, const char *) {
-            dest.client = (unsigned char)client;
-            dest.port   = (unsigned char)p;
-            found = true;
-            return false;
+            snd_seq_addr_t a;
+            a.client = (unsigned char)client;
+            a.port   = (unsigned char)p;
+            cands.push_back(a);
+            return true;
         });
-        if (!found) {
+        if (cands.empty()) {
             fprintf(stderr, "alsamidi: no external MIDI port found (try --list-midi / -m)\n");
             snd_seq_close(seq);
             return false;
         }
     }
 
-    // Subscribe our source port to the destination.
+    // Subscribe our source port to the first candidate that accepts it (some
+    // listed ports refuse connections — don't let one of those end the search).
     snd_seq_addr_t sender; sender.client = snd_seq_client_id(seq); sender.port = myport;
-    snd_seq_port_subscribe_t *sub; snd_seq_port_subscribe_alloca(&sub);
-    snd_seq_port_subscribe_set_sender(sub, &sender);
-    snd_seq_port_subscribe_set_dest(sub, &dest);
-    if (snd_seq_subscribe_port(seq, sub) < 0) {
-        fprintf(stderr, "alsamidi: cannot connect to %d:%d\n", dest.client, dest.port);
+    snd_seq_addr_t dest = cands[0];
+    bool connected = false;
+    for (const snd_seq_addr_t &c : cands) {
+        snd_seq_port_subscribe_t *sub; snd_seq_port_subscribe_alloca(&sub);
+        snd_seq_port_subscribe_set_sender(sub, &sender);
+        snd_seq_port_subscribe_set_dest(sub, &c);
+        if (snd_seq_subscribe_port(seq, sub) >= 0) { dest = c; connected = true; break; }
+        fprintf(stderr, "alsamidi: cannot connect to %d:%d\n", c.client, c.port);
+    }
+    if (!connected) {
         snd_seq_close(seq);
         return false;
     }
+
+    // A running queue lets events be stamped for delivery slightly in the
+    // future (see set_delay). Without one, everything just goes out at once.
+    m_queue = snd_seq_alloc_queue(seq);
+    if (m_queue >= 0) {
+        snd_seq_start_queue(seq, m_queue, nullptr);
+        snd_seq_drain_output(seq);
+    }
+    m_delay_ns = 0;
 
     // Cache a human-readable destination name.
     snd_seq_client_info_t *ci; snd_seq_client_info_alloca(&ci);
     m_dest_name.clear();
     if (snd_seq_get_any_client_info(seq, dest.client, ci) >= 0)
         m_dest_name = snd_seq_client_info_get_name(ci);
+    m_dest_client = m_dest_name;
     char tail[16]; snprintf(tail, sizeof tail, " %d:%d", dest.client, dest.port);
     m_dest_name += tail;
 
@@ -130,7 +147,27 @@ void AlsaMidi::close()
 {
     if (m_seq) { panic(); snd_seq_close(m_seq); }
     m_seq = nullptr; m_port = -1; m_dst_client = m_dst_port = -1;
+    m_queue = -1; m_delay_ns = 0;   // the queue died with the sequencer handle
     m_dest_name.clear();
+    m_dest_client.clear();
+}
+
+// Address one prepared event to our subscribers and send it: stamped for
+// m_delay_ns from now when there is a delay (and a queue), else immediately.
+void AlsaMidi::deliver(void *evp, bool now)
+{
+    snd_seq_event_t *ev = static_cast<snd_seq_event_t *>(evp);
+    snd_seq_ev_set_source(ev, m_port);
+    snd_seq_ev_set_subs(ev);
+    if (!now && m_queue >= 0 && m_delay_ns > 0) {
+        snd_seq_real_time_t rt;
+        rt.tv_sec  = (unsigned)(m_delay_ns / 1000000000LL);
+        rt.tv_nsec = (unsigned)(m_delay_ns % 1000000000LL);
+        snd_seq_ev_schedule_real(ev, m_queue, 1 /* relative */, &rt);
+    } else {
+        snd_seq_ev_set_direct(ev);
+    }
+    snd_seq_event_output_direct(m_seq, ev);
 }
 
 void AlsaMidi::send(uint8_t type, uint8_t channel, uint8_t d0, uint8_t d1)
@@ -139,9 +176,6 @@ void AlsaMidi::send(uint8_t type, uint8_t channel, uint8_t d0, uint8_t d1)
 
     snd_seq_event_t ev;
     snd_seq_ev_clear(&ev);
-    snd_seq_ev_set_source(&ev, m_port);
-    snd_seq_ev_set_subs(&ev);
-    snd_seq_ev_set_direct(&ev);
 
     int ch = channel & 0x0f;
     switch (type) {
@@ -154,7 +188,7 @@ void AlsaMidi::send(uint8_t type, uint8_t channel, uint8_t d0, uint8_t d1)
     case 0xE: snd_seq_ev_set_pitchbend(&ev, ch, (int)(d0 | (d1 << 7)) - 8192); break;
     default:  return;
     }
-    snd_seq_event_output_direct(m_seq, &ev);
+    deliver(&ev, false);
 }
 
 void AlsaMidi::send_sysex(const uint8_t *data, size_t len)
@@ -162,21 +196,24 @@ void AlsaMidi::send_sysex(const uint8_t *data, size_t len)
     if (!m_seq || !data || len == 0) return;
     snd_seq_event_t ev;
     snd_seq_ev_clear(&ev);
-    snd_seq_ev_set_source(&ev, m_port);
-    snd_seq_ev_set_subs(&ev);
-    snd_seq_ev_set_direct(&ev);
     snd_seq_ev_set_sysex(&ev, (unsigned)len, const_cast<uint8_t *>(data));
-    snd_seq_event_output_direct(m_seq, &ev);
+    deliver(&ev, false);
 }
 
 void AlsaMidi::panic()
 {
     if (!m_seq) return;
-    for (int ch = 0; ch < 16; ++ch) {
-        send(0xB, ch, 120, 0);   // all sound off
-        send(0xB, ch, 123, 0);   // all notes off
-        send(0xB, ch, 121, 0);   // reset all controllers
-    }
+    // Forget anything still waiting in the queue (notes about to start), then
+    // silence what is sounding — immediately, not on the delay.
+    snd_seq_drop_output(m_seq);
+    static const int ccs[] = { 120, 123, 121 };   // sound off, notes off, reset ctrls
+    for (int ch = 0; ch < 16; ++ch)
+        for (int cc : ccs) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_controller(&ev, ch, cc, 0);
+            deliver(&ev, true);
+        }
     snd_seq_drain_output(m_seq);
 }
 
@@ -185,6 +222,12 @@ std::string AlsaMidi::dest_addr() const
     if (!m_seq) return "";
     char a[16]; snprintf(a, sizeof a, "%d:%d", m_dst_client, m_dst_port);
     return a;
+}
+
+std::string AlsaMidi::dest_spec() const
+{
+    if (!m_seq || m_dest_client.empty()) return "";
+    return m_dest_client + ":" + std::to_string(m_dst_port);
 }
 
 std::vector<MidiPort> AlsaMidi::enumerate()

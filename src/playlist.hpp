@@ -14,6 +14,7 @@
 #define PLAYLIST_HPP
 
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <cstdint>
 
@@ -24,15 +25,19 @@ struct Track {
 
 class Playlist {
 public:
+    Playlist();   // seeds the shuffle RNG, so every run shuffles differently
+
     // Scan `folder` for MIDI files. If recurse, descend into subfolders.
     // Appends to the current list (call clear() first to replace), skipping
     // files already listed. Returns the number of tracks added. Tracks are
-    // kept sorted by path.
+    // kept in natural, case-insensitive path order ("Track 2" before
+    // "Track 10").
     int add_folder(const std::string &folder, bool recurse);
 
-    // Add a single file (any extension — the caller vouches it is a MIDI).
-    // No-op if it is already listed.
-    void add_file(const std::string &path);
+    // Add files (any extension — the caller vouches they are MIDIs), skipping
+    // any already listed. Returns the number added. One sort for the batch.
+    int  add_files(const std::vector<std::string> &paths);
+    void add_file(const std::string &path) { add_files({ path }); }
 
     void clear();
 
@@ -56,24 +61,28 @@ public:
     void select_display_index(int display_idx);
 
     // Shuffle control. Toggling on builds a random order with the current
-    // track moved to the front of the remaining queue; toggling off restores
-    // natural order with the same track still current.
+    // track moved to the front, so every other track is still to come;
+    // toggling off restores natural order with the same track still current.
+    // In shuffle, next() wrapping around (loop) re-rolls the order.
     void set_shuffle(bool on);
     bool shuffle() const { return m_shuffle; }
 
-    // Re-roll the shuffle order (keeps current track current). No-op if the
-    // list isn't shuffled.
-    void reshuffle();
+    // Re-roll the shuffle order. keep_current pins the current track to the
+    // front; pass false before playback starts so the first track is random
+    // too. No-op if the list isn't shuffled.
+    void reshuffle(bool keep_current = true);
 
 private:
     // Storage is stable; m_order maps display position -> storage index.
     std::vector<Track>    m_storage;   // natural (sorted) order
     std::vector<Track>    m_tracks;    // display order (view; rebuilt on toggle)
+    std::unordered_set<std::string> m_paths;   // what m_storage holds (dedupe)
     bool                  m_shuffle = false;
     int                   m_cursor  = 0;   // index into m_tracks (display order)
     uint64_t              m_rng_state = 0x9E3779B97F4A7C15ull;
 
     uint64_t next_rand();
+    void sort_storage();
     void rebuild_view(const std::string &keep_current_path);
 };
 

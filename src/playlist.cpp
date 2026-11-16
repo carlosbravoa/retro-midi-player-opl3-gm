@@ -4,9 +4,10 @@
 #include "playlist.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <cctype>
-#include <unordered_set>
+#include <random>
 
 namespace fs = std::filesystem;
 
@@ -31,7 +32,49 @@ static std::string norm_path(const fs::path &p)
     return (ec ? p : a).lexically_normal().string();
 }
 
-// splitmix64 — deterministic, no global RNG, seedable per instance.
+// Natural, case-insensitive order: digit runs compare as numbers, letters
+// ignore case; exact bytes only break ties (keeping it a strict ordering).
+static bool natural_less(const std::string &a, const std::string &b)
+{
+    auto dig = [](char c){ return std::isdigit((unsigned char)c) != 0; };
+    size_t i = 0, j = 0;
+    while(i < a.size() && j < b.size()){
+        if(dig(a[i]) && dig(b[j])){
+            size_t i0 = i, j0 = j;
+            while(i0 < a.size() && a[i0] == '0') ++i0;   // leading zeros don't count
+            while(j0 < b.size() && b[j0] == '0') ++j0;
+            size_t i1 = i0, j1 = j0;
+            while(i1 < a.size() && dig(a[i1])) ++i1;
+            while(j1 < b.size() && dig(b[j1])) ++j1;
+            if(i1 - i0 != j1 - j0) return i1 - i0 < j1 - j0;   // more digits = bigger
+            int c = a.compare(i0, i1 - i0, b, j0, j1 - j0);
+            if(c) return c < 0;
+            i = i1; j = j1;
+            continue;
+        }
+        int x = std::tolower((unsigned char)a[i]), y = std::tolower((unsigned char)b[j]);
+        if(x != y) return x < y;
+        ++i; ++j;
+    }
+    bool a_done = i >= a.size(), b_done = j >= b.size();
+    if(a_done != b_done) return a_done;
+    return a < b;
+}
+
+Playlist::Playlist()
+{
+    std::random_device rd;
+    m_rng_state ^= ((uint64_t)rd() << 32) ^ rd()
+                 ^ (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+}
+
+void Playlist::sort_storage()
+{
+    std::sort(m_storage.begin(), m_storage.end(),
+              [](const Track &a, const Track &b){ return natural_less(a.path, b.path); });
+}
+
+// splitmix64 — no global RNG, one state per instance.
 uint64_t Playlist::next_rand()
 {
     uint64_t z = (m_rng_state += 0x9E3779B97F4A7C15ull);
@@ -44,19 +87,25 @@ void Playlist::clear()
 {
     m_storage.clear();
     m_tracks.clear();
+    m_paths.clear();
     m_cursor = 0;
 }
 
-void Playlist::add_file(const std::string &path)
+int Playlist::add_files(const std::vector<std::string> &paths)
 {
     std::string keep = current() ? current()->path : std::string();
-    std::string n = norm_path(path);
-    for(const Track &t : m_storage)
-        if(t.path == n) return;   // already listed
-    m_storage.push_back(Track{n, fs::path(n).stem().string()});
-    std::sort(m_storage.begin(), m_storage.end(),
-              [](const Track &a, const Track &b){ return a.path < b.path; });
-    rebuild_view(keep);
+    int added = 0;
+    for(const std::string &path : paths){
+        std::string n = norm_path(path);
+        if(!m_paths.insert(n).second) continue;   // already listed
+        m_storage.push_back(Track{n, fs::path(n).stem().string()});
+        ++added;
+    }
+    if(added){
+        sort_storage();
+        rebuild_view(keep);
+    }
+    return added;
 }
 
 int Playlist::add_folder(const std::string &folder, bool recurse)
@@ -64,13 +113,11 @@ int Playlist::add_folder(const std::string &folder, bool recurse)
     std::string keep = current() ? current()->path : std::string();
     int added = 0;
     std::error_code ec;
-    std::unordered_set<std::string> have;
-    for(const Track &t : m_storage) have.insert(t.path);
 
     auto consider = [&](const fs::path &p){
         if(!is_midi(p)) return;
         std::string n = norm_path(p);
-        if(!have.insert(n).second) return;   // already listed
+        if(!m_paths.insert(n).second) return;   // already listed
         m_storage.push_back(Track{n, p.stem().string()});
         ++added;
     };
@@ -89,9 +136,10 @@ int Playlist::add_folder(const std::string &folder, bool recurse)
         }
     }
 
-    std::sort(m_storage.begin(), m_storage.end(),
-              [](const Track &a, const Track &b){ return a.path < b.path; });
-    rebuild_view(keep);
+    if(added){
+        sort_storage();
+        rebuild_view(keep);
+    }
     return added;
 }
 
@@ -107,11 +155,16 @@ void Playlist::rebuild_view(const std::string &keep_current_path)
         }
     }
 
-    // Keep the previously-current track current across the reorder.
+    // Keep the previously-current track current across the reorder. In
+    // shuffle it goes to the front, so the whole rest of the list follows it
+    // (left mid-list, everything shuffled ahead of it would never play).
     m_cursor = 0;
     if(!keep_current_path.empty()){
         for(size_t i = 0; i < m_tracks.size(); ++i){
-            if(m_tracks[i].path == keep_current_path){ m_cursor = (int)i; break; }
+            if(m_tracks[i].path != keep_current_path) continue;
+            if(m_shuffle) std::swap(m_tracks[0], m_tracks[i]);
+            else          m_cursor = (int)i;
+            break;
         }
     }
 }
@@ -133,7 +186,17 @@ bool Playlist::next(bool loop)
 {
     if(m_tracks.empty()) return false;
     if(m_cursor + 1 < (int)m_tracks.size()){ ++m_cursor; return true; }
-    if(loop){ m_cursor = 0; return true; }
+    if(loop){
+        if(m_shuffle && m_tracks.size() > 1){
+            // New lap, new order — but don't open it with the track that
+            // just finished.
+            std::string last = m_tracks.back().path;
+            rebuild_view(std::string());
+            if(m_tracks[0].path == last) std::swap(m_tracks[0], m_tracks.back());
+        }
+        m_cursor = 0;
+        return true;
+    }
     return false;   // past the end, not looping
 }
 
@@ -159,9 +222,9 @@ void Playlist::set_shuffle(bool on)
     rebuild_view(keep);
 }
 
-void Playlist::reshuffle()
+void Playlist::reshuffle(bool keep_current)
 {
     if(!m_shuffle) return;
-    std::string keep = current() ? current()->path : std::string();
+    std::string keep = (keep_current && current()) ? current()->path : std::string();
     rebuild_view(keep);
 }

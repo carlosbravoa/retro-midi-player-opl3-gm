@@ -24,6 +24,9 @@ struct Config {
     int  win_h   = 600;
     // Board serial device: "ttyACM0", "/dev/ttyUSB1", ... or "none" (PC only).
     std::string serial_dev = "ttyACM0";
+    int  volume  = 100;     // PC output volume, percent (0..200)
+    std::string midi_dev;       // last external MIDI device ("Client name:port")
+    std::string last_folder;    // folder reopened when started with no files
 };
 
 std::string config_path();            // full path to the config file

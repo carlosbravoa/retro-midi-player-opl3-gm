@@ -16,6 +16,6 @@ struct Config;
 
 // Runs the GUI. Reads initial style/output/recurse from `cfg`, and writes the
 // user's final settings back into `cfg` on exit (the caller persists them).
-bool gui_run(Engine &engine, Playlist &playlist, Config &cfg);
+bool gui_run(Engine &engine, Playlist &playlist, Config &cfg, bool autoplay);
 
 #endif /* GUI_HPP */

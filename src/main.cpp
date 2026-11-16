@@ -12,6 +12,12 @@
 #include "gui.hpp"
 #include "alsamidi.hpp"
 #include "config.hpp"
+#include "serial_ports.hpp"
+
+// Set by build.sh from snap/snapcraft.yaml (the one place the version lives).
+#ifndef APP_VERSION
+#define APP_VERSION "dev"
+#endif
 
 #include <adlmidi.h>
 #include <SDL.h>
@@ -47,12 +53,16 @@ static void usage(const char *prog)
 "  --no-gui      Headless: stream the playlist with no window (Ctrl-C to quit)\n"
 "  --list-banks  Print libADLMIDI's built-in banks and exit\n"
 "  --list-midi   Print available external MIDI ports and exit\n"
+"  --list-ports  Print the USB-serial devices a board could be on and exit\n"
+"  --version     Print the version and exit\n"
 "  -h, --help    This help\n\n"
 "In the GUI: click a track to play it, click the progress bar to seek, use OUT:\n"
 "to switch Board / PC / External MIDI, BANK < > (or [ ]) to change FM\n"
 "instruments (Board/PC only), SHUF/LOOP toggles, and OPEN FOLDER (needs zenity\n"
-"or kdialog) to add more music. Click a visualizer bar to mute that OPL3\n"
-"channel, right-click to solo it, 'u' to unmute all.\n", prog);
+"or kdialog) or drag files/folders onto the window to add more music; '/'\n"
+"finds a track by name. Click a visualizer bar to mute that OPL3 channel,\n"
+"right-click to solo it, 'u' to unmute all. Started with no files, the GUI\n"
+"reopens the last folder.\n", prog);
 }
 
 // A reasonable default bank for arbitrary MIDIs: the first whose name mentions
@@ -100,6 +110,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-gui")) gui = false;
         else if (!strcmp(a, "--list-banks")) { list_banks(); return 0; }
         else if (!strcmp(a, "--list-midi")) { AlsaMidi::list_ports(); return 0; }
+        else if (!strcmp(a, "--list-ports")) { serial_ports_list(); return 0; }
+        else if (!strcmp(a, "--version")) { printf("opl3-rw-midi-player %s\n", APP_VERSION); return 0; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
         else if (a[0] == '-' && a[1] && strcmp(a, "-")) { fprintf(stderr, "Unknown option: %s\n", a); usage(argv[0]); return 1; }
         else inputs.push_back(a);
@@ -112,13 +124,29 @@ int main(int argc, char **argv)
 
     // ── Build the playlist ────────────────────────────────────────────────────
     Playlist playlist;
+    std::vector<std::string> files;
     for (const auto &in : inputs) {
         // A directory is scanned; anything else is added as a file.
         std::error_code ec;
-        if (std::filesystem::is_directory(in, ec)) playlist.add_folder(in, recurse);
-        else                                      playlist.add_file(in);
+        if (std::filesystem::is_directory(in, ec)) {
+            playlist.add_folder(in, recurse);
+            cfg.last_folder = std::filesystem::absolute(in, ec).lexically_normal().string();
+        } else {
+            files.push_back(in);
+        }
     }
+    playlist.add_files(files);
+
+    // Nothing asked for: the GUI picks up where it left off, with the last
+    // folder loaded but not playing (don't blast music at launch).
+    bool autoplay = true;
+    if (inputs.empty() && gui && !cfg.last_folder.empty()) {
+        playlist.add_folder(cfg.last_folder, recurse);
+        autoplay = false;
+    }
+
     playlist.set_shuffle(shuffle);
+    playlist.reshuffle(false);   // nothing is playing yet: random first track too
 
     if (playlist.empty() && !gui) {
         fprintf(stderr, "No MIDI files. Pass a folder or .mid file (or use the GUI to open one).\n");
@@ -139,6 +167,8 @@ int main(int argc, char **argv)
         return 1;
     }
     engine.set_loop(loop == 1);
+    engine.set_volume(cfg.volume / 100.0f);
+    engine.set_midi_hint(cfg.midi_dev);
     // Headless has no output selector, so pick one: an explicitly-requested
     // external MIDI device wins, else the board if present, else PC.
     if (!gui) {
@@ -159,7 +189,7 @@ int main(int argc, char **argv)
     cfg.bank = bank; cfg.recurse = recurse; cfg.loop = loop; cfg.shuffle = shuffle;
 
     if (gui) {
-        if (gui_run(engine, playlist, cfg)) {
+        if (gui_run(engine, playlist, cfg, autoplay)) {
             config_save(cfg);   // persist the user's final settings
         } else {
             fprintf(stderr, "GUI unavailable — falling back to headless.\n");
@@ -173,13 +203,21 @@ int main(int argc, char **argv)
         signal(SIGTERM, on_sigint);
         bool wrap = (loop == 2);
         bool playing = play_from_playlist(engine, playlist, wrap, true);
-        while (!g_int && playing) {
+        bool resume_board = false;   // the board dropped out: go back when it returns
+        for (int tick = 0; !g_int && playing; ++tick) {
             if (engine.consume_song_ended())
                 playing = playlist.next(wrap) && play_from_playlist(engine, playlist, wrap, true);
             if (engine.board_out() && !engine.board_available()) {
                 fprintf(stderr, "Board lost — continuing on PC audio.\n");
                 engine.set_board_out(false);
                 engine.set_pc_out(true);
+                resume_board = true;
+            }
+            if (tick % 10 == 9 && engine.poll_board_reconnect() && resume_board) {
+                fprintf(stderr, "Board is back — returning to it.\n");
+                engine.set_pc_out(false);
+                engine.set_board_out(true);
+                resume_board = false;
             }
             SDL_Delay(100);
         }
