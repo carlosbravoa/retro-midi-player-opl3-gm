@@ -62,7 +62,7 @@ static void usage(const char *prog)
 "or kdialog) or drag files/folders onto the window to add more music; '/'\n"
 "finds a track by name. Click a visualizer bar to mute that OPL3 channel,\n"
 "right-click to solo it, 'u' to unmute all. Started with no files, the GUI\n"
-"reopens the last folder.\n", prog);
+"reopens the last folder. Press '?' in the player for all the keys.\n", prog);
 }
 
 // A reasonable default bank for arbitrary MIDIs: the first whose name mentions

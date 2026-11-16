@@ -20,7 +20,7 @@ static std::string to_lower(std::string s)
 static bool is_midi(const fs::path &p)
 {
     std::string ext = to_lower(p.extension().string());
-    return ext == ".mid" || ext == ".midi";
+    return ext == ".mid" || ext == ".midi" || ext == ".kar" || ext == ".rmi";
 }
 
 // Absolute, normalised form, so the same file added twice (via "./x.mid" and
@@ -212,6 +212,21 @@ void Playlist::select_display_index(int display_idx)
 {
     if(display_idx < 0 || display_idx >= (int)m_tracks.size()) return;
     m_cursor = display_idx;
+}
+
+bool Playlist::remove_display_index(int display_idx)
+{
+    if(display_idx < 0 || display_idx >= (int)m_tracks.size()) return false;
+    const std::string path = m_tracks[display_idx].path;
+    m_tracks.erase(m_tracks.begin() + display_idx);
+    m_paths.erase(path);
+    for(size_t i = 0; i < m_storage.size(); ++i)
+        if(m_storage[i].path == path){ m_storage.erase(m_storage.begin() + (long)i); break; }
+
+    bool was_current = (display_idx == m_cursor);
+    if(display_idx < m_cursor) --m_cursor;
+    if(m_cursor >= (int)m_tracks.size()) m_cursor = m_tracks.empty() ? 0 : (int)m_tracks.size() - 1;
+    return was_current;
 }
 
 void Playlist::set_shuffle(bool on)

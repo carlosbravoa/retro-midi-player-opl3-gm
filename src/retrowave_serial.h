@@ -56,7 +56,10 @@ void retrowave_discard(void);
 // wedged) prints once, clears retrowave_active and returns false.
 bool retrowave_send(const uint8_t *buf, size_t len);
 
-// Full chip reset (0xfe, settle, 0xff, settle).  No-op if not active.
+// Silence the chip via its registers (all keys off, fastest release), then a
+// full hardware reset (0xfe, settle, 0xff, settle).  The register part is what
+// silences RetroWave-compatible boards that don't implement the reset pulse.
+// No-op if not active.
 void retrowave_reset(void);
 
 // Close the device and clear retrowave_active.

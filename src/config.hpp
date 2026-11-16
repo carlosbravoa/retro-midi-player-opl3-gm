@@ -29,6 +29,12 @@ struct Config {
     std::string last_folder;    // folder reopened when started with no files
 };
 
+// Per-song FM bank memory (file "song_banks" beside the config): the bank the
+// user last chose while a given file was playing, by bank *name* (ordinals
+// shift between libADLMIDI versions). Loaded on first use; set() saves at once.
+std::string song_bank_get(const std::string &path);    // "" = none remembered
+void        song_bank_set(const std::string &path, const std::string &bank_name);
+
 std::string config_path();            // full path to the config file
 bool config_load(Config &c);          // fills c from disk; false if no file
 void config_save(const Config &c);    // writes c (creating the directory)

@@ -3,7 +3,7 @@
  *
  * A Playlist is a flat list of tracks discovered by scanning one or more
  * folders (optionally recursing into subfolders) for Standard MIDI Files
- * (.mid / .midi, case-insensitive). It owns two orderings: the natural
+ * (.mid / .midi / .kar / .rmi, case-insensitive). It owns two orderings: the natural
  * (sorted) order and a shuffled order. Toggling shuffle never loses your place
  * — the currently playing track stays current, the rest are reordered around
  * it. Navigation (next / prev) walks whichever order is active.
@@ -40,6 +40,10 @@ public:
     void add_file(const std::string &path) { add_files({ path }); }
 
     void clear();
+
+    // Drop one track by display position. Returns true if it was the current
+    // track (the cursor then rests on the one that followed it, if any).
+    bool remove_display_index(int display_idx);
 
     bool   empty() const { return m_tracks.empty(); }
     size_t size()  const { return m_tracks.size(); }

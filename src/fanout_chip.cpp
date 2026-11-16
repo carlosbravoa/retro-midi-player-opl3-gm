@@ -20,6 +20,7 @@ std::atomic<bool> g_gm_out{false};
 volatile uint8_t  g_opl_regs[512] = {0};
 std::atomic<uint32_t> g_opl_mute{0};
 std::atomic<bool>     g_opl_hold{false};
+std::vector<OplWrite> *g_opl_capture = nullptr;
 
 uint8_t fanout_mask(uint16_t addr, uint8_t data)
 {
@@ -41,6 +42,7 @@ void fanout_send(uint16_t addr, uint8_t data)
 {
     if (retrowave_active && g_board_out.load(std::memory_order_relaxed))
         retrowave_write(addr, data);
+    if (g_opl_capture) g_opl_capture->push_back(OplWrite{ addr, data });
     adlib_write(addr, data);
 }
 

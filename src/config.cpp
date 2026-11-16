@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -81,4 +82,49 @@ void config_save(const Config &c)
     f << "volume="  << c.volume      << "\n";
     f << "midi_dev="    << c.midi_dev    << "\n";
     f << "last_folder=" << c.last_folder << "\n";
+}
+
+// ── Per-song banks ────────────────────────────────────────────────────────────
+// One "bank name<TAB>file path" per line.
+static std::map<std::string, std::string> g_song_banks;
+static bool g_song_banks_loaded = false;
+
+static std::string song_banks_path()
+{
+    return fs::path(config_path()).parent_path().string() + "/song_banks";
+}
+
+static void song_banks_load()
+{
+    if (g_song_banks_loaded) return;
+    g_song_banks_loaded = true;
+    std::ifstream f(song_banks_path());
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t tab = line.find('\t');
+        if (tab == std::string::npos || tab == 0 || tab + 1 >= line.size()) continue;
+        g_song_banks[line.substr(tab + 1)] = line.substr(0, tab);
+    }
+}
+
+std::string song_bank_get(const std::string &path)
+{
+    song_banks_load();
+    auto it = g_song_banks.find(path);
+    return it == g_song_banks.end() ? std::string() : it->second;
+}
+
+void song_bank_set(const std::string &path, const std::string &bank_name)
+{
+    song_banks_load();
+    if (path.empty() || path.find('\n') != std::string::npos) return;
+    auto it = g_song_banks.find(path);
+    if (it != g_song_banks.end() && it->second == bank_name) return;
+    g_song_banks[path] = bank_name;
+
+    std::string p = song_banks_path();
+    std::error_code ec;
+    fs::create_directories(fs::path(p).parent_path(), ec);
+    std::ofstream f(p, std::ios::trunc);
+    for (const auto &kv : g_song_banks) f << kv.second << '\t' << kv.first << '\n';
 }

@@ -173,10 +173,35 @@ to play).
 
 ### GUI controls
 
-`space` play/pause · `n` next track · `p` prev track · `s` stop · `l` loop ·
-`h` shuffle · `v` visualizer style · `o` cycle output (Board/PC/EXT-MIDI) ·
-`d` board serial port · `+`/`-` tempo · `9`/`0` volume · `/` (or `f`) find a
-track · `q`/`Esc` quit.
+Press `?` (or `F1`) in the player for the full key list.
+
+`space` play/pause · `n`/`p` next/previous track · `s` stop · `Left`/`Right`
+seek 5 s (`Shift`: 30 s) · `l` loop · `h` shuffle · `+`/`-` tempo · `9`/`0`
+volume · `o` cycle output (Board/PC/EXT-MIDI) · `d` board serial port · `b`
+bank list · `[`/`]` previous/next bank · `a` flip to the previous bank ·
+`v` visualizer style · `F11` fullscreen visualizer · `/` (or `f`) find a
+track · `Del` remove the track under the mouse · `e` export · `q`/`Esc` quit.
+The keyboard's media keys and the desktop's media controls (MPRIS) work too,
+also while the window is not focused.
+
+**Banks:** click the bank name (or press `b`) for the whole list; type to
+filter it, click or use `Up`/`Down` to switch while the song plays, and `a` to
+flip back and forth between the last two. The bank you pick while a song is
+playing is remembered for that song (shown as `BANK*`) and comes back with it;
+songs without one use the bank you chose last.
+
+**Visualizer:** four styles — LED, neon and spectrum bars, and `KEYS`, a
+keyboard strip per channel with the sounding notes lit. Hover a channel to
+inspect it: the instrument, the note, and its two FM operators (waveform,
+envelope, level). Click to mute, right-click to solo. With External MIDI as
+the output it shows the 16 MIDI channels instead, with their instruments, and
+mutes apply to those. Lyrics in the file (karaoke `.kar` included) are shown
+as they are sung.
+
+**Export:** `EXPORT` (or `e`) renders the current track, start to end, to
+`<name>.opl3.vgm` (an OPL3 register log for VGM players, including real-hardware
+ones) and/or `<name>.opl3.wav`, next to the MIDI file — with the bank and
+channel mutes as they are set.
 
 **Adding music:** `OPEN FOLDER`, or drag files and folders onto the window.
 `CLEAR` empties the playlist. Tracks are listed in natural order (`Track 2`

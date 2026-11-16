@@ -101,16 +101,24 @@ $CC  $CFLAGS                   -c "$SCRIPT_DIR/src/retrowave_serial.c" -o "$OBJ_
 # C++ sources.
 # The version lives in one place: snap/snapcraft.yaml.
 APP_VERSION="$(sed -n "s/^version: *'\(.*\)'.*/\1/p" "$SCRIPT_DIR/snap/snapcraft.yaml" 2>/dev/null | head -n1)"
-for u in playlist alsamidi config serial_ports board_writer engine fanout_chip gui main; do
-    $CXX $CXXFLAGS $INC -DAPP_VERSION="\"${APP_VERSION:-dev}\"" -c "$SCRIPT_DIR/src/$u.cpp" -o "$OBJ_DIR/$u.o"
+# Desktop media controls (MPRIS) need sd-bus from libsystemd; optional.
+MPRIS_CFLAGS=""; MPRIS_LIBS=""
+if pkg-config --exists libsystemd 2>/dev/null; then
+    MPRIS_CFLAGS="-DHAVE_MPRIS $(pkg-config --cflags libsystemd)"
+    MPRIS_LIBS="$(pkg-config --libs libsystemd)"
+else
+    echo ">>> libsystemd-dev not found: building without desktop media-key (MPRIS) support"
+fi
+for u in playlist alsamidi config serial_ports durations mpris board_writer engine fanout_chip gui main; do
+    $CXX $CXXFLAGS $INC $MPRIS_CFLAGS -DAPP_VERSION="\"${APP_VERSION:-dev}\"" -c "$SCRIPT_DIR/src/$u.cpp" -o "$OBJ_DIR/$u.o"
 done
 
 # Link (-lasound for the external ALSA MIDI output).
 $CXX $CXXFLAGS -o "$BIN" \
     "$OBJ_DIR/opl.o" "$OBJ_DIR/retrowave_serial.o" \
-    "$OBJ_DIR/playlist.o" "$OBJ_DIR/alsamidi.o" "$OBJ_DIR/config.o" "$OBJ_DIR/serial_ports.o" "$OBJ_DIR/board_writer.o" \
+    "$OBJ_DIR/playlist.o" "$OBJ_DIR/alsamidi.o" "$OBJ_DIR/config.o" "$OBJ_DIR/serial_ports.o" "$OBJ_DIR/durations.o" "$OBJ_DIR/mpris.o" "$OBJ_DIR/board_writer.o" \
     "$OBJ_DIR/engine.o" "$OBJ_DIR/fanout_chip.o" "$OBJ_DIR/gui.o" "$OBJ_DIR/main.o" \
-    -L"$INSTALL_DIR/lib" -lADLMIDI $SDL_LIBS -lasound -lm -lpthread
+    -L"$INSTALL_DIR/lib" -lADLMIDI $SDL_LIBS $MPRIS_LIBS -lasound -lm -lpthread
 
 echo ""
 echo ">>> Done: $BIN"

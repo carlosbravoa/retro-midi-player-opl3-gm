@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <string>
 #include <cstdint>
 
@@ -111,6 +112,38 @@ public:
     // reloaded with the new patches and resumes where it was.
     bool set_bank(int bank_no);
     int  bank() const { return m_bank_no; }
+    // Bank for the *next* load() only — no reload of what is playing now.
+    void set_next_bank(int bank_no) { m_bank_no = bank_no; }
+    // The bank songs play with unless one is remembered for them: the last
+    // one chosen with set_bank(). (bank() is what is loaded right now.)
+    int  default_bank() const { return m_default_bank; }
+
+    // ── What is playing, for the display ─────────────────────────────────────
+    // Instrument last keyed on OPL3 channel ch (0..17): 0..127 = GM program,
+    // 128 + key = percussion, -1 = nothing yet (see gm_names.h).
+    int channel_instrument(int ch) const;
+
+    // The song as MIDI (16 channels), tracked whatever the output is; this is
+    // what an external synth is playing.
+    int   midi_program(int ch) const;                  // 0..127
+    void  midi_held(int ch, uint8_t vel[128]) const;   // velocity of each held key, 0 = up
+    float midi_take_peak(int ch);   // loudest note-on since the last call, 0..1
+    // Per-MIDI-channel mute for the External output (bit N = channel N):
+    // muted channels' note-ons are not forwarded.
+    void     set_midi_mute_mask(uint32_t mask);
+    uint32_t midi_mute_mask() const { return m_midi_mute.load(); }
+
+    // Text carried by the file: title/copyright, and the lyric line being sung
+    // right now ("" when there is none).
+    std::string title() const;
+    std::string copyright() const;
+    std::string lyric() const;
+
+    // Render `src` from start to end, offline, to a VGM register log and/or a
+    // WAV ("" = skip that one). Playback is interrupted for the duration and
+    // then put back where it was. False (with `err`) on failure.
+    bool export_song(const std::string &src, const std::string &vgm_path,
+                     const std::string &wav_path, std::string &err);
 
     // True exactly once after the current song reaches its end (poll it).
     bool consume_song_ended() { return m_song_ended.exchange(false); }
@@ -131,12 +164,18 @@ private:
     // libADLMIDI raw-MIDI-event hook -> external MIDI device (audio thread).
     static void raw_event_cb(void *ud, uint8_t type, uint8_t subtype,
                              uint8_t channel, const uint8_t *data, size_t len);
-    void on_raw_event(uint8_t type, uint8_t channel, const uint8_t *data, size_t len);
+    void on_raw_event(uint8_t type, uint8_t subtype, uint8_t channel,
+                      const uint8_t *data, size_t len);
+    void on_lyric(const uint8_t *data, size_t len, bool kar_text);
+    // libADLMIDI note hook: which instrument each OPL3 channel is playing.
+    static void note_cb(void *ud, int adlchn, int note, int ins, int pressure, double bend);
+    void reset_song_state();   // display state of the previous song; audio lock held
 
     ADL_MIDIPlayer   *m_adl = nullptr;
     SDL_AudioDeviceID m_dev = 0;
     unsigned          m_rate = 44100;
     int               m_bank_no = 0;
+    int               m_default_bank = 0;
     double            m_tempo = 1.0;
     bool              m_loop = false;
     bool              m_have_board = false;
@@ -156,6 +195,18 @@ private:
     std::atomic<bool>   m_song_ended{false};
     std::atomic<double> m_pos{0.0};
     std::atomic<double> m_len{0.0};
+
+    // Display state. Written on the audio thread, read by the GUI: plain
+    // bytes/ints whose torn reads are harmless, except the strings (mutex).
+    std::atomic<int>      m_chan_ins[18];
+    std::atomic<int>      m_midi_prog[16];
+    std::atomic<uint8_t>  m_midi_vel[16][128];
+    std::atomic<uint8_t>  m_midi_peak[16];
+    std::atomic<uint32_t> m_midi_mute{0};
+    mutable std::mutex    m_text_mx;
+    std::string           m_title, m_copyright, m_lyric;
+    bool                  m_lyric_break = false;   // next lyric text starts a new line
+    bool                  m_is_kar = false;        // .kar: lyrics live in text events
 
     std::atomic<float> m_volume{1.0f};
     static constexpr float kBaseGain = 2.0f;   // emulator output runs quiet

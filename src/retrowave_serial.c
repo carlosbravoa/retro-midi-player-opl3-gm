@@ -214,10 +214,38 @@ void retrowave_write(unsigned int idx, uint8_t val)
 	}
 }
 
+// One register write, framed and sent right now (never staged).
+static void rw_reg_now(unsigned int idx, uint8_t val)
+{
+	uint8_t reg = (uint8_t)(idx & 0xff);
+	uint8_t hi = (idx & 0x100) ? 0xe5 : 0xe1;   // address latch: port 1 / port 0
+	uint8_t b[] = { RW_BOARD_OPL3, 0x12, hi, reg, (uint8_t)(hi + 2), val, 0xfb, val };
+	uint8_t packed[64];
+	retrowave_send(packed, rw_pack(b, sizeof(b), packed));
+}
+
 void retrowave_reset(void)
 {
 	if (!retrowave_active)
 		return;
+
+	// Silence the chip through its registers first: key every channel off,
+	// drop the rhythm keys, and set every operator to the fastest release so
+	// nothing rings on.  The reset pulse below does all this on a RetroWave,
+	// but it is a GPIO toggle on that board's I/O expander — a compatible
+	// board that only implements register writes ignores it, and would be
+	// left holding its notes.  Harmless before a real reset.
+	static const uint8_t op_off[18] = { 0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13,
+	                                    16, 17, 18, 19, 20, 21 };
+	for (unsigned int set = 0; set <= 0x100; set += 0x100)
+	{
+		for (unsigned int c = 0; c < 9; c++)
+			rw_reg_now(set + 0xB0 + c, 0x00);
+		for (unsigned int o = 0; o < 18; o++)
+			rw_reg_now(set + 0x80 + op_off[o], 0xFF);
+	}
+	rw_reg_now(0xBD, 0x00);
+
 	// Always sent directly (never staged): the sleeps are part of the reset.
 	uint8_t lo[] = { RW_BOARD_OPL3, 0x12, 0xfe };
 	uint8_t hi[] = { RW_BOARD_OPL3, 0x12, 0xff };

@@ -50,6 +50,13 @@ layout:
   /usr/share/alsa:
     bind: $SNAP/usr/share/alsa
 
+slots:
+  # The player publishes org.mpris.MediaPlayer2.opl3-rw-midi-player on the
+  # session bus so media keys and the desktop's player widget can control it.
+  mpris:
+    interface: mpris
+    name: opl3-rw-midi-player
+
 apps:
   retro-midi-player-opl3-gm:
     command: bin/opl3-launch
@@ -62,6 +69,8 @@ apps:
       - serial-port        # RetroWave OPL3 Express board — connect manually
       - home               # load MIDI folders from your home directory
       - removable-media    # load MIDI folders from USB drives
+    slots:
+      - mpris              # media keys / desktop player controls
 
 parts:
   # Fetch libADLMIDI during the (networked) pull phase so the build itself is
@@ -98,6 +107,7 @@ parts:
       - make
       - git
       - pkg-config
+      - libsystemd-dev     # sd-bus, for the MPRIS media controls
       - libsdl2-dev
       - libasound2-dev
     stage-packages:

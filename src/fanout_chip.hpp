@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 // libADLMIDI internal API (headers live in libADLMIDI/src, not the install).
 #include <adlmidi.h>
@@ -61,6 +62,11 @@ extern std::atomic<uint32_t> g_opl_mute;
 // Pause hold: while set, every channel is masked as if muted (same key-off
 // path), so pausing silences held notes on the board and resume re-keys them.
 extern std::atomic<bool> g_opl_hold;
+
+// Export capture: while non-null, every (masked) register write is also
+// appended here, in order. Audio lock held by whoever sets it.
+struct OplWrite { uint16_t addr; uint8_t data; };
+extern std::vector<OplWrite> *g_opl_capture;
 
 // Apply the mute mask to one register write (returns the value to send).
 uint8_t fanout_mask(uint16_t addr, uint8_t data);
