@@ -30,6 +30,25 @@ volatile bool retrowave_active = false;
 
 static int rw_fd = -1;
 static bool rw_dummy = false;  // dry-run: frame but don't write to hardware
+static char rw_err[320] = "";  // why the last retrowave_open() failed
+
+const char *retrowave_last_error(void)
+{
+	return rw_err;
+}
+
+// Record (and print) an open failure, and release the half-opened device.
+static bool rw_open_fail(const char *what, const char *path)
+{
+	snprintf(rw_err, sizeof(rw_err), "%s %s: %s", what, path, strerror(errno));
+	fprintf(stderr, "retrowave: %s\n", rw_err);
+	if (rw_fd >= 0)
+	{
+		close(rw_fd);
+		rw_fd = -1;
+	}
+	return false;
+}
 
 // Staging buffer for buffered mode (see retrowave_set_buffered).  Frames are
 // at most ~16 bytes; if a burst ever overflows it, the extra is sent directly.
@@ -185,6 +204,7 @@ bool retrowave_open(const char *dev)
 {
 	if (dev == NULL || dev[0] == '\0')
 		dev = "ttyACM0";
+	rw_err[0] = '\0';
 
 	if (strcmp(dev, "-") == 0)
 	{
@@ -195,7 +215,7 @@ bool retrowave_open(const char *dev)
 	}
 
 	char path[256];
-	if (strncmp(dev, "/dev/", 5) == 0)
+	if (dev[0] == '/')   // any absolute path (e.g. a symlink elsewhere) as-is
 		snprintf(path, sizeof(path), "%s", dev);
 	else
 		snprintf(path, sizeof(path), "/dev/%s", dev);
@@ -203,32 +223,19 @@ bool retrowave_open(const char *dev)
 	// Non-blocking so a wedged device can't hang the writer (see retrowave_send).
 	rw_fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
 	if (rw_fd < 0)
-	{
-		fprintf(stderr, "retrowave: cannot open %s: %s\n", path, strerror(errno));
-		return false;
-	}
+		return rw_open_fail("cannot open", path);
 
 	struct termios tio;
 	memset(&tio, 0, sizeof(tio));
-	if (tcgetattr(rw_fd, &tio) != 0)
-	{
-		fprintf(stderr, "retrowave: tcgetattr failed: %s\n", strerror(errno));
-		close(rw_fd);
-		rw_fd = -1;
-		return false;
-	}
+	if (tcgetattr(rw_fd, &tio) != 0)   // e.g. ENOTTY: not a serial device
+		return rw_open_fail("not a serial port?", path);
 	cfmakeraw(&tio);
 	tio.c_cflag |= (CLOCAL | CREAD);
 	tio.c_cflag &= ~CRTSCTS;
 	cfsetispeed(&tio, B2000000);  // 2 Mbaud — mandatory
 	cfsetospeed(&tio, B2000000);
 	if (tcsetattr(rw_fd, TCSANOW, &tio) != 0)
-	{
-		fprintf(stderr, "retrowave: tcsetattr failed: %s\n", strerror(errno));
-		close(rw_fd);
-		rw_fd = -1;
-		return false;
-	}
+		return rw_open_fail("cannot set 2 Mbaud on", path);
 
 	retrowave_active = true;
 	retrowave_reset();

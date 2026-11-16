@@ -155,7 +155,7 @@ opl3-rw-midi-player [options] [folder | file.mid ...]
 
 | Option | Description |
 |---|---|
-| `-d DEV` | RetroWave serial device (default `ttyACM0`; `-` = dry-run, `none` = PC only) |
+| `-d DEV` | Board serial device, e.g. `ttyUSB1` or a full path (default: the one last used, initially `ttyACM0`; `-` = dry-run, `none` = PC only) |
 | `-m PORT` | External ALSA MIDI device (`20:0`, a client name, or `auto`) |
 | `-r` | Recurse into subfolders when scanning |
 | `-b N` | Start on FM bank `#N` (default: a General-MIDI-ish bank) |
@@ -171,7 +171,14 @@ Command-line flags override the saved settings for that run.
 
 `space` play/pause · `n` next track · `p` prev track · `s` stop · `l` loop ·
 `h` shuffle · `v` visualizer style · `o` cycle output (Board/PC/EXT-MIDI) ·
-`+`/`-` tempo · `q`/`Esc` quit.
+`d` board serial port · `+`/`-` tempo · `q`/`Esc` quit.
+
+**Board serial port:** the `PORT` button (or `d`) lists the USB-serial devices
+that are plugged in (`ttyACM*` / `ttyUSB*`, with their USB product names). Click
+one to move the board there — it takes effect immediately, mid-song, and is
+remembered for the next run. For anything not in the list (a udev symlink, a
+differently named device) type its name or full path in the field and press
+Enter. Any board that speaks the RetroWave OPL3 protocol at 2 Mbaud works.
 
 **Playlist:** click a row to play it; mouse-wheel or `↑`/`↓` scroll a line;
 `←`/`→` (or `PgUp`/`PgDn`) scroll a page; `Home`/`End` jump. The `OUT:` button

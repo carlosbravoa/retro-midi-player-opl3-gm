@@ -24,11 +24,14 @@
 // fails (e.g. unplugged mid-song) — poll it to notice a lost board.
 extern volatile bool retrowave_active;
 
-// Open the board.  dev may be given with or without the "/dev/" prefix; pass
+// Open the board.  dev is an absolute path or a name under /dev/; pass
 // "-" for a dry run (frames are discarded, useful for testing without hardware).
 // Performs a full chip reset on success.  Returns true on success; on failure
 // prints an error, leaves retrowave_active false, and returns false.
 bool retrowave_open(const char *dev);
+
+// Why the last retrowave_open() failed ("" if it succeeded), for display.
+const char *retrowave_last_error(void);
 
 // One OPL register write.  idx 0x000-0x0FF -> first register set (port 0);
 // idx 0x100-0x1FF -> second register set (port 1).  No-op if not active.

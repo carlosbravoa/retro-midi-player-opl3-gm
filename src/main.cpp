@@ -33,8 +33,10 @@ static void usage(const char *prog)
 "Express (and/or your PC's speakers) via libADLMIDI FM synthesis.\n\n"
 "Usage: %s [options] [folder | file.mid ...]\n\n"
 "Options:\n"
-"  -d DEV        RetroWave serial device (default: ttyACM0; '-' = dry-run\n"
-"                framing with no hardware; 'none' = PC audio only)\n"
+"  -d DEV        RetroWave serial device, e.g. ttyUSB1 or /dev/ttyUSB1 (default:\n"
+"                the one last used, initially ttyACM0; '-' = dry-run framing\n"
+"                with no hardware; 'none' = PC audio only). Also selectable\n"
+"                in the GUI with the PORT button.\n"
 "  -m PORT       External MIDI device (ALSA), e.g. '20:0' or a client name, or\n"
 "                'auto' for the first one found. Enables the External output.\n"
 "  -r            Recurse into subfolders when scanning folders\n"
@@ -80,7 +82,7 @@ int main(int argc, char **argv)
     Config cfg;
     config_load(cfg);
 
-    std::string serial_dev = "ttyACM0";
+    std::string serial_dev = cfg.serial_dev;
     std::string midi_port;
     bool recurse = cfg.recurse, shuffle = cfg.shuffle, gui = true;
     int  loop = cfg.loop;   // 0 off, 1 track, 2 playlist

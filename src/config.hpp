@@ -22,6 +22,8 @@ struct Config {
     int  outmode = -1;      // output: -1 auto, 0 PC, 1 BOARD, 2 EXT-MIDI
     int  win_w   = 980;     // GUI window size
     int  win_h   = 600;
+    // Board serial device: "ttyACM0", "/dev/ttyUSB1", ... or "none" (PC only).
+    std::string serial_dev = "ttyACM0";
 };
 
 std::string config_path();            // full path to the config file

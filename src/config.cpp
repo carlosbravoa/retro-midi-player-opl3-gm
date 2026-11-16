@@ -52,6 +52,7 @@ bool config_load(Config &c)
         else if (k == "outmode") c.outmode = n;
         else if (k == "win_w")   c.win_w   = n;
         else if (k == "win_h")   c.win_h   = n;
+        else if (k == "serial_dev") c.serial_dev = v;
     }
     return true;
 }
@@ -73,4 +74,5 @@ void config_save(const Config &c)
     f << "outmode=" << c.outmode     << "\n";
     f << "win_w="   << c.win_w       << "\n";
     f << "win_h="   << c.win_h       << "\n";
+    f << "serial_dev=" << c.serial_dev << "\n";
 }

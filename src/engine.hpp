@@ -70,6 +70,14 @@ public:
     bool pc_out() const;
     bool gm_out() const;
     bool board_available() const;   // a board (or dry-run) is open and alive
+
+    // (Re)open the board on another serial device at any time: closes the
+    // current one first. "" just closes it (PC only). Board output is left
+    // off — call set_board_out(true) to route to the new board. On failure
+    // no board is open, board_dev() is unchanged and retrowave_last_error()
+    // says why.
+    bool open_board(const std::string &serial_dev);
+    const std::string &board_dev() const { return m_serial_dev; }   // as requested
     bool gm_available() const;      // an external MIDI port is connected
     bool gm_connectable() const;    // connected, or one could be connected now
     bool ensure_midi();             // connect the external device if not already
@@ -119,6 +127,7 @@ private:
     bool              m_have_board = false;
     bool              m_have_midi = false;
     std::string       m_cur_path;
+    std::string       m_serial_dev;  // board device last asked for ("" = none)
     std::string       m_midi_port;   // configured -m target ("" = auto-pick)
     AlsaMidi          m_midi;
 

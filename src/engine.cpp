@@ -21,17 +21,9 @@ bool Engine::init(unsigned sample_rate, const std::string &serial_dev,
     // ── RetroWave board ───────────────────────────────────────────────────────
     // "" -> no board (PC only); "-" -> dry run; else open the serial device.
     // A missing board is not fatal: we simply fall back to PC audio.
-    if(!serial_dev.empty()){
-        m_have_board = retrowave_open(serial_dev.c_str());
-        if(!m_have_board)
-            fprintf(stderr, "engine: no RetroWave board — PC audio only\n");
-    }
-    if(m_have_board){
-        // From here on register writes are staged and delivered, paced, by
-        // the writer thread (see board_writer.hpp).
-        retrowave_set_buffered(true);
-        m_writer.start();
-    }
+    if(!open_board(serial_dev) && !serial_dev.empty())
+        fprintf(stderr, "engine: no RetroWave board — PC audio only\n");
+    m_serial_dev = serial_dev;         // the configured device, present or not
     g_board_out.store(m_have_board);   // don't route to a board that isn't there
 
     // ── External MIDI device ──────────────────────────────────────────────────
@@ -81,6 +73,30 @@ void Engine::shutdown()
     if(m_have_midi){ m_midi.close(); m_have_midi = false; }
     if(m_adl){ adl_panic(m_adl); adl_close(m_adl); m_adl = nullptr; }
     if(m_have_board){ retrowave_reset(); retrowave_close(); m_have_board = false; }
+}
+
+// Swap the board's serial device. The audio lock is held throughout so the
+// callback never stages writes for a half-open board; that costs a short
+// audio dropout (the chip resets take ~20 ms each), fine for a manual switch.
+bool Engine::open_board(const std::string &serial_dev)
+{
+    if(m_dev) SDL_LockAudioDevice(m_dev);
+    g_board_out.store(false);
+    m_writer.stop();                       // nothing may write while we swap
+    if(m_have_board){ retrowave_reset(); retrowave_close(); m_have_board = false; }
+
+    if(!serial_dev.empty())
+        m_have_board = retrowave_open(serial_dev.c_str());
+    if(m_have_board || serial_dev.empty())
+        m_serial_dev = serial_dev;         // a failed attempt isn't remembered
+    if(m_have_board){
+        // From here on register writes are staged and delivered, paced, by
+        // the writer thread (see board_writer.hpp).
+        retrowave_set_buffered(true);
+        m_writer.start();
+    }
+    if(m_dev) SDL_UnlockAudioDevice(m_dev);
+    return m_have_board;
 }
 
 // ── Song loading (locks the audio callback out while reconfiguring) ───────────
