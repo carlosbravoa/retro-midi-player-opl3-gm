@@ -1,0 +1,83 @@
+# Builds the AppImage for amd64 and arm64. Runs on every v* tag (and attaches
+# the files to that tag's GitHub release), or by hand from the Actions tab.
+#
+# Built inside AlmaLinux 8 on purpose: an AppImage needs a glibc at least as
+# new as its build host's, so the older the host, the more distros it runs on.
+# AlmaLinux 8 has glibc 2.28, which covers Debian 10+, Ubuntu 18.10+, RHEL 8+
+# and everything newer, while still being a supported distro that ships a
+# recent SDL2.
+name: AppImage
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    container: almalinux:8
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y dnf-plugins-core
+          dnf config-manager --set-enabled powertools
+          # The stock GCC 8 predates std::filesystem; gcc-toolset-13 has it and
+          # still produces binaries that only need the system's old libstdc++.
+          dnf install -y \
+            gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ \
+            cmake make git pkgconf-pkg-config curl file findutils which \
+            SDL2-devel alsa-lib-devel systemd-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Build AppImage
+        run: |
+          source /opt/rh/gcc-toolset-13/enable
+          export CC=gcc CXX=g++
+          packaging/appimage/build-appimage.sh
+
+      - name: Report the glibc the binary needs
+        run: |
+          objdump -T opl3-rw-midi-player | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -n 1
+
+      - name: Smoke test
+        run: |
+          set -o pipefail
+          ./*.AppImage --appimage-extract-and-run --list-banks | head -n 5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage-${{ runner.arch }}
+          path: '*.AppImage'
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: appimage-*
+          merge-multiple: true
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" ./*.AppImage --clobber

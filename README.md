@@ -71,6 +71,39 @@ This produces `./opl3-rw-midi-player`. Run it:
 
 ---
 
+## Run as an AppImage
+
+A single file that runs with no install step on any distro with glibc 2.28 or
+newer (Debian 10+, Ubuntu 18.10+, RHEL/Alma/Rocky 8+, Fedora, Arch, openSUSE
+Leap 15.3+ and so on). Download the one
+for your CPU from the
+[releases page](https://github.com/carlosbravoa/retro-midi-player-opl3-gm/releases),
+then:
+
+```sh
+chmod +x OPL3_RetroWave_MIDI_Player-*.AppImage
+./OPL3_RetroWave_MIDI_Player-*.AppImage ~/midis/
+```
+
+- It is not sandboxed, so there are no interfaces to connect. For the RetroWave
+  board your user only needs access to the serial port, which on most distros
+  means being in the `dialout` group (`uucp` on Arch):
+  `sudo usermod -aG dialout $USER`, then log out and back in.
+- Settings live in `~/.config/opl3-rw-midi-player/config`, shared with a
+  from-source build.
+- The **Open Folder** button uses the `zenity` or `kdialog` already on your
+  system.
+- If it will not start with a FUSE error, install `libfuse2` or run it with
+  `--appimage-extract-and-run`.
+
+The release files are built by `.github/workflows/appimage.yml` inside an
+AlmaLinux 8 container, on every `v*` tag. You can run
+`packaging/appimage/build-appimage.sh` directly to test the packaging, but an
+AppImage built that way only runs on distros at least as new as the machine
+that built it, so it should not be published.
+
+---
+
 ## Install as a snap
 
 ### 1. Build and install

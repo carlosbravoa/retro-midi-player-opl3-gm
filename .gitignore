@@ -10,5 +10,8 @@
 /stage/
 /prime/
 
+# AppImage
+*.AppImage
+
 # local-only, never commit
 CLAUDE.md
