@@ -67,6 +67,8 @@ else
     cmake -B "$BUILD_DIR" -S "$LIBADLMIDI_DIR" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_INSTALL_INCLUDEDIR=include \
         -DlibADLMIDI_STATIC=ON \
         -DlibADLMIDI_SHARED=OFF \
         -DUSE_HW_SERIAL=OFF \
